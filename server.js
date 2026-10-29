@@ -11,7 +11,7 @@ const app = express();
 app.disable("x-powered-by");
 app.set("trust proxy", Number(process.env.TRUST_PROXY_HOPS ?? 0));
 app.use(helmet({ crossOriginResourcePolicy: false }));
-const configuredOrigins = () => new Set([...(process.env.ALLOWED_ORIGINS || "").split(","), process.env.FRONTEND_URL, process.env.CLIENT_URL, process.env.APP_URL].filter(Boolean).flatMap((value) => { try { return [new URL(value.trim()).origin]; } catch { return []; } }));
+const configuredOrigins = () => new Set(["https://admin.coachmax.server24.in", ...(process.env.ALLOWED_ORIGINS || "").split(","), process.env.FRONTEND_URL, process.env.CLIENT_URL, process.env.APP_URL].filter(Boolean).flatMap((value) => { try { return [new URL(value.trim()).origin]; } catch { return []; } }));
 app.use(cors({ origin(origin, callback) {
   if (!origin || configuredOrigins().has(origin) || (process.env.NODE_ENV !== "production" && /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin))) return callback(null, true);
   return callback(Object.assign(new Error("Origin is not allowed"), { status: 403 }));

@@ -1,5 +1,7 @@
-name: Backend quality
-on: [push, pull_request]
+name: Backend quality and deployment
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
 jobs:
   verify:
     runs-on: ubuntu-latest
@@ -14,3 +16,49 @@ jobs:
       - run: npm run check
       - run: npm test
       - run: npm audit --omit=dev --audit-level=moderate
+
+  deploy:
+    name: Deploy backend API
+    needs: verify
+    if: github.ref == 'refs/heads/main' && vars.DEPLOY_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure SSH
+        env:
+          DEPLOY_HOST: ${{ vars.DEPLOY_HOST || '50.6.44.47' }}
+          DEPLOY_PORT: ${{ vars.DEPLOY_PORT || '22' }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+        run: |
+          test -n "$DEPLOY_SSH_KEY" || { echo "Missing DEPLOY_SSH_KEY secret"; exit 1; }
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -p "$DEPLOY_PORT" -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+      - name: Upload application
+        env:
+          DEPLOY_HOST: ${{ vars.DEPLOY_HOST || '50.6.44.47' }}
+          DEPLOY_PORT: ${{ vars.DEPLOY_PORT || '22' }}
+          DEPLOY_USER: ${{ vars.DEPLOY_USER }}
+          DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
+        run: |
+          test -n "$DEPLOY_USER" || { echo "Missing DEPLOY_USER Actions variable"; exit 1; }
+          test -n "$DEPLOY_PATH" || { echo "Missing DEPLOY_PATH Actions variable"; exit 1; }
+          ssh -i ~/.ssh/id_ed25519 -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" "mkdir -p '$DEPLOY_PATH'"
+          rsync -az -e "ssh -i ~/.ssh/id_ed25519 -p $DEPLOY_PORT" \
+            --exclude='.git/' --exclude='node_modules/' --exclude='uploads/' \
+            --exclude='.env' --exclude='.env.*' --exclude='config/serviceAccountKey.json' \
+            ./ "$DEPLOY_USER@$DEPLOY_HOST:$DEPLOY_PATH/"
+      - name: Install production dependencies and restart API
+        env:
+          DEPLOY_HOST: ${{ vars.DEPLOY_HOST || '50.6.44.47' }}
+          DEPLOY_PORT: ${{ vars.DEPLOY_PORT || '22' }}
+          DEPLOY_USER: ${{ vars.DEPLOY_USER }}
+          DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
+          PM2_APP_NAME: ${{ vars.PM2_APP_NAME || 'coachmax' }}
+        run: |
+          ssh -i ~/.ssh/id_ed25519 -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" \
+            "cd '$DEPLOY_PATH' && npm ci --omit=dev && pm2 reload '$PM2_APP_NAME' --update-env && pm2 save"
+      - name: Verify live API
+        run: curl --fail --silent --show-error --retry 10 --retry-all-errors --retry-delay 3 https://coachmax.server24.in/health/live
