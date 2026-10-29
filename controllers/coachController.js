@@ -1,0 +1,1394 @@
+const Class = require("../models/Class");
+const Team = require("../models/Team");
+const User = require("../models/User");
+const Attendance = require("../models/Attendance");
+const CoachNote = require("../models/CoachNote");
+const MedicalProfile = require("../models/MedicalProfile");
+const Term = require("../models/Term");
+const mongoose = require("mongoose");
+const Admin = require("../models/Admin");
+const Notification = require("../models/Notification");
+const ChatRoom = require("../models/ChatRoom");
+const { dateOnly, dateOnlyStartUtc, dateOnlyEndUtc, ageGroupForYear, ageGroupContextYear } = require("../utils/dateTime");
+
+const _generateDatesForDayCoach = (start, end, targetDay) => {
+  const dates = [];
+  let current = dateOnlyStartUtc(start, "term.startDate");
+  while (current.getUTCDay() !== targetDay) {
+    current.setUTCDate(current.getUTCDate() + 1);
+  }
+  while (current <= end) {
+    dates.push(new Date(current));
+    current.setUTCDate(current.getUTCDate() + 7);
+  }
+  return dates;
+};
+
+const DAY_MAP_COACH = {
+  SUNDAY: 0, MONDAY: 1, TUESDAY: 2, WEDNESDAY: 3,
+  THURSDAY: 4, FRIDAY: 5, SATURDAY: 6,
+};
+
+const generateClassSessions = (term, classObj) => {
+  const sessions = [];
+  if (classObj && classObj.sessionDates && Array.isArray(classObj.sessionDates) && classObj.sessionDates.length > 0) {
+    return [...classObj.sessionDates]
+      .map((d) => {
+        return dateOnlyStartUtc(d, "sessionDate");
+      })
+      .sort((a, b) => a.getTime() - b.getTime());
+  }
+  if (!term || !term.startDate || !term.endDate || !classObj) {
+    return sessions;
+  }
+
+  const start = dateOnlyStartUtc(term.startDate, "term.startDate");
+  const end = dateOnlyEndUtc(term.endDate, "term.endDate");
+
+  const scheduleType = classObj.scheduleType || "SINGLE_DAY";
+  const schedule = classObj.schedule || [];
+
+  if ((scheduleType === "WEEKDAYS" || scheduleType === "CUSTOM") && schedule.length > 0) {
+    for (const entry of schedule) {
+      const targetDay = DAY_MAP_COACH[(entry.dayOfWeek || "").toUpperCase()];
+      if (targetDay === undefined) continue;
+      sessions.push(..._generateDatesForDayCoach(start, end, targetDay));
+    }
+    sessions.sort((a, b) => a.getTime() - b.getTime());
+  } else {
+    if (!classObj.dayOfWeek) return sessions;
+    const targetDay = DAY_MAP_COACH[classObj.dayOfWeek.toUpperCase()];
+    if (targetDay === undefined) return sessions;
+    sessions.push(..._generateDatesForDayCoach(start, end, targetDay));
+  }
+
+  return sessions;
+};
+
+const getSessionTimesForDateCoach = (classObj, sessionDate) => {
+  const dayNames = ["SUNDAY", "MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY"];
+  const scheduleType = classObj.scheduleType || "SINGLE_DAY";
+  const schedule = classObj.schedule || [];
+
+  if ((scheduleType === "WEEKDAYS" || scheduleType === "CUSTOM") && schedule.length > 0) {
+    const dayName = dayNames[dateOnlyStartUtc(sessionDate, "sessionDate").getUTCDay()];
+    const entry = schedule.find((e) => (e.dayOfWeek || "").toUpperCase() === dayName);
+    if (entry) return { startTime: entry.startTime, endTime: entry.endTime };
+  }
+  return { startTime: classObj.startTime, endTime: classObj.endTime };
+};
+
+exports.getMyAssignedClasses = async (req, res) => {
+  try {
+    const coachId = req.admin._id;
+    let {
+      page = 1,
+      limit = 20,
+      search = "",
+      day,
+      dayOfWeek,
+      programId,
+      categoryId,
+      termId,
+      term,
+      date,
+      dayDate,
+      startDate,
+      endDate,
+      weekDate,
+      week,
+      filterType,
+    } = req.query;
+
+    page = Number(page);
+    limit = Number(limit);
+
+    const query = {
+      $or: [{ coach: coachId }, { assistantCoach: coachId }],
+      status: "ACTIVE",
+    };
+
+    const selectedTerm = termId || term;
+    if (selectedTerm) {
+      query.term = selectedTerm;
+    }
+
+    if (programId) query.program = programId;
+    if (categoryId) query.category = categoryId;
+
+    if (search) {
+      query.name = { $regex: search, $options: "i" };
+    }
+
+    const weekdays = [
+      "SUNDAY",
+      "MONDAY",
+      "TUESDAY",
+      "WEDNESDAY",
+      "THURSDAY",
+      "FRIDAY",
+      "SATURDAY",
+    ];
+
+    let sessionStartRange = null;
+    let sessionEndRange = null;
+
+    const selectedDayParam = day || dayOfWeek;
+    const isWeekFilter =
+      filterType === "week" ||
+      Boolean(weekDate) ||
+      Boolean(week) ||
+      Boolean(startDate && endDate);
+    const isDayFilter =
+      filterType === "day" ||
+      Boolean(date) ||
+      Boolean(dayDate) ||
+      Boolean(selectedDayParam && !isWeekFilter);
+
+    if (isWeekFilter) {
+      if (startDate && endDate) {
+        sessionStartRange = dateOnlyStartUtc(startDate, "startDate");
+        sessionEndRange = dateOnlyEndUtc(endDate, "endDate");
+      } else {
+        const refDateStr =
+          weekDate ||
+          date ||
+          (selectedDayParam && !isNaN(Date.parse(selectedDayParam))
+            ? selectedDayParam
+            : null);
+        const refDate = refDateStr ? dateOnlyStartUtc(refDateStr, "date") : dateOnlyStartUtc(dateOnly(new Date(), "today"), "today");
+
+        if (!isNaN(refDate.getTime())) {
+          const dayIdx = refDate.getUTCDay();
+          const diffToMonday = dayIdx === 0 ? -6 : 1 - dayIdx;
+
+          sessionStartRange = new Date(refDate);
+          sessionStartRange.setUTCDate(refDate.getUTCDate() + diffToMonday);
+          sessionStartRange.setUTCHours(0, 0, 0, 0);
+
+          sessionEndRange = new Date(sessionStartRange);
+          sessionEndRange.setUTCDate(sessionStartRange.getUTCDate() + 6);
+          sessionEndRange.setUTCHours(23, 59, 59, 999);
+        }
+      }
+
+      if (
+        selectedDayParam &&
+        weekdays.includes(selectedDayParam.toUpperCase())
+      ) {
+        query.$and = query.$and || [];
+        query.$and.push({ $or: [
+          { dayOfWeek: { $regex: new RegExp(`^${selectedDayParam}$`, "i") } },
+          { "schedule.dayOfWeek": { $regex: new RegExp(`^${selectedDayParam}$`, "i") } },
+        ] });
+      }
+    } else if (isDayFilter) {
+      if (
+        selectedDayParam &&
+        weekdays.includes(selectedDayParam.toUpperCase())
+      ) {
+        query.$and = query.$and || [];
+        query.$and.push({ $or: [
+          { dayOfWeek: { $regex: new RegExp(`^${selectedDayParam}$`, "i") } },
+          { "schedule.dayOfWeek": { $regex: new RegExp(`^${selectedDayParam}$`, "i") } },
+        ] });
+      } else {
+        const targetDateStr = date || dayDate || selectedDayParam;
+        const targetDate = targetDateStr
+          ? dateOnlyStartUtc(targetDateStr, "date")
+          : dateOnlyStartUtc(dateOnly(new Date(), "today"), "today");
+
+        if (!isNaN(targetDate.getTime())) {
+          const dayName = weekdays[targetDate.getUTCDay()];
+          query.$and = query.$and || [];
+          query.$and.push({ $or: [
+            { dayOfWeek: { $regex: new RegExp(`^${dayName}$`, "i") } },
+            { "schedule.dayOfWeek": { $regex: new RegExp(`^${dayName}$`, "i") } },
+          ] });
+
+          sessionStartRange = new Date(targetDate);
+          sessionStartRange.setUTCHours(0, 0, 0, 0);
+
+          sessionEndRange = new Date(targetDate);
+          sessionEndRange.setUTCHours(23, 59, 59, 999);
+        }
+      }
+    }
+
+    if (sessionStartRange && sessionEndRange) {
+      const activeTerms = await Term.find({
+        startDate: { $lte: sessionEndRange },
+        endDate: { $gte: sessionStartRange },
+      }).select("_id");
+
+      const activeTermIds = activeTerms.map((t) => t._id.toString());
+
+      if (selectedTerm) {
+        if (!activeTermIds.includes(selectedTerm.toString())) {
+          return res.json({
+            success: true,
+            message: "Assigned classes fetched successfully",
+            totalClasses: 0,
+            page,
+            limit,
+            totalPages: 0,
+            data: [],
+          });
+        }
+      } else {
+        query.term = { $in: activeTerms.map((t) => t._id) };
+      }
+
+      const weekdaysInRange = [];
+      const tempDate = new Date(sessionStartRange);
+      const limitDate = new Date(sessionStartRange);
+      limitDate.setUTCDate(limitDate.getUTCDate() + 7);
+      const endCheck = sessionEndRange < limitDate ? sessionEndRange : limitDate;
+
+      while (tempDate <= endCheck) {
+        const dayName = weekdays[tempDate.getUTCDay()];
+        if (!weekdaysInRange.includes(dayName)) {
+          weekdaysInRange.push(dayName);
+        }
+        tempDate.setUTCDate(tempDate.getUTCDate() + 1);
+      }
+
+      if (!query.$and?.some(c => c.$or?.some(o => o.dayOfWeek || o["schedule.dayOfWeek"])) && weekdaysInRange.length > 0) {
+        const regexes = weekdaysInRange.map((d) => new RegExp(`^${d}$`, "i"));
+        query.$and = query.$and || [];
+        query.$and.push({ $or: [
+          { dayOfWeek: { $in: regexes } },
+          { "schedule.dayOfWeek": { $in: regexes } },
+        ] });
+      }
+    }
+
+    const total = await Class.countDocuments(query);
+
+    const classes = await Class.find(query)
+      .populate("term", "name startDate endDate year")
+      .populate("program", "name ageGroup")
+      .populate("category", "name ageRange")
+      .populate("coach", "name email mobile")
+      .populate("assistantCoach", "name email mobile")
+      .populate(
+        "players",
+        "fullName profileImage dob isMedicalCondition medicalConditionDetails"
+      )
+      .sort({ dayOfWeek: 1, startTime: 1 })
+      .skip((page - 1) * limit)
+      .limit(limit);
+
+    const classIds = classes.map((cls) => cls._id);
+    const chatRooms = await ChatRoom.find({
+      classId: { $in: classIds },
+      type: "BROADCAST",
+    }).select("_id classId");
+
+    const chatRoomMap = {};
+    chatRooms.forEach((room) => {
+      if (room.classId) {
+        chatRoomMap[room.classId.toString()] = room._id;
+      }
+    });
+
+    const result = [];
+
+    for (const cls of classes) {
+      let sessions = [];
+      if (cls.term) {
+        sessions = generateClassSessions(cls.term, cls);
+      }
+
+      if (sessionStartRange && sessionEndRange) {
+        sessions = sessions.filter(
+          (sessionDate) =>
+            sessionDate >= sessionStartRange && sessionDate <= sessionEndRange
+        );
+      }
+
+      const formattedSessions = sessions.map((dateObj) => ({
+        date: dateOnly(dateObj, "sessionDate"),
+        day: dateObj.getUTCDate(),
+        month: dateObj.getUTCMonth() + 1,
+        year: dateObj.getUTCFullYear(),
+      }));
+
+      const roomId = chatRoomMap[cls._id.toString()] || null;
+
+      result.push({
+        classId: cls._id,
+        className: cls.name,
+        chatRoomId: roomId,
+        dayOfWeek: cls.dayOfWeek,
+        startTime: cls.startTime,
+        endTime: cls.endTime,
+        venue: cls.venue || cls.location || "",
+        location: cls.location || "",
+        sessionDuration: cls.sessionDuration,
+        trainingType: cls.trainingType,
+        capacity: cls.capacity,
+        term: cls.term,
+        program: cls.program,
+        category: cls.category,
+        coach: cls.coach,
+        assistantCoach: cls.assistantCoach,
+        totalPlayers: cls.players.length,
+        players: cls.players,
+        totalSessions: formattedSessions.length,
+        sessions: formattedSessions,
+      });
+    }
+
+    res.json({
+      success: true,
+      message: "Assigned classes fetched successfully",
+      totalClasses: total,
+      page,
+      limit,
+      totalPages: Math.ceil(total / limit),
+      data: result,
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+
+exports.getClassDropdown = async (req, res) => {
+  try {
+    const adminId = req.admin._id;
+
+    const admin = await Admin.findById(adminId).select("role");
+
+    if (!admin) {
+      return res.status(404).json({
+        success: false,
+        message: "Admin not found",
+      });
+    }
+
+    let query = {
+      status: "ACTIVE",
+    };
+
+    if (admin.role === "COACH") {
+      query.$and = query.$and || [];
+      query.$and.push({
+        $or: [
+          { coach: adminId },
+          { assistantCoach: adminId },
+        ]
+      });
+    }
+
+    const { term, category, program, day } = req.query;
+    if (term) {
+      query.term = term;
+    }
+    if (category) {
+      query.category = category;
+    }
+    if (program) {
+      query.program = program;
+    }
+    if (day) {
+      query.$and = query.$and || [];
+      query.$and.push({
+        $or: [
+          { dayOfWeek: { $regex: new RegExp(`^${day}$`, "i") } },
+          { "schedule.dayOfWeek": { $regex: new RegExp(`^${day}$`, "i") } },
+        ]
+      });
+    }
+
+    const classes = await Class.find(query)
+      .select("_id name")
+      .sort({ name: 1 });
+
+    return res.status(200).json({
+      success: true,
+      message: "Classes fetched successfully",
+      data: classes,
+    });
+  } catch (error) {
+    return res.status(500).json({
+      success: false,
+      message: error.message,
+    });
+  }
+};
+
+exports.getAssignedClassById = async (req, res) => {
+  try {
+    const { classId } = req.params;
+
+    const cls = await Class.findById(classId)
+      .populate("term", "name startDate endDate year")
+      .populate("program", "name ageGroup description")
+      .populate("category", "name ageRange")
+      .populate("coach", "name email mobile")
+      .populate("assistantCoach", "name email mobile")
+      .populate({
+        path: "players",
+        select: "fullName profileImage dob gender isMedicalCondition medicalConditionDetails parentId assignedClasses",
+        populate: {
+          path: "parentId",
+          select: "fullName phone email emergencyContact",
+        },
+      });
+
+    if (!cls) {
+      return res.status(404).json({ success: false, message: "Class not found" });
+    }
+
+    const attendanceRecords = await Attendance.find({ class: classId })
+      .select("sessionDate records markedBy createdAt updatedAt")
+      .populate("markedBy", "name email")
+      .sort({ sessionDate: -1 });
+
+    const playerAttendanceMap = {};
+
+    attendanceRecords.forEach((attDoc) => {
+      const dateStr = attDoc.sessionDate
+        ? dateOnly(attDoc.sessionDate, "attendance.sessionDate")
+        : "";
+
+      (attDoc.records || []).forEach((rec) => {
+        if (!rec.player) return;
+        const pid = rec.player.toString();
+
+        if (!playerAttendanceMap[pid]) {
+          playerAttendanceMap[pid] = {
+            presentCount: 0,
+            absentCount: 0,
+            lateCount: 0,
+            totalMarked: 0,
+            records: [],
+          };
+        }
+
+        const stats = playerAttendanceMap[pid];
+        stats.totalMarked += 1;
+
+        const statusUpper = (rec.status || "ABSENT").toUpperCase();
+        if (statusUpper === "PRESENT") stats.presentCount += 1;
+        else if (statusUpper === "ABSENT") stats.absentCount += 1;
+        else if (statusUpper === "LATE") stats.lateCount += 1;
+
+        stats.records.push({
+          sessionDate: dateStr,
+          status: rec.status,
+          comment: rec.comment || "",
+          remarks: rec.remarks || "",
+          reason: rec.reason || "",
+          lateArrival: Boolean(rec.lateArrival),
+        });
+      });
+    });
+    const enrichedPlayers = cls.players.map((p) => {
+      const playerObj = p.toObject ? p.toObject() : { ...p };
+      const pid = playerObj._id.toString();
+      const stats = playerAttendanceMap[pid] || {
+        presentCount: 0,
+        absentCount: 0,
+        lateCount: 0,
+        totalMarked: 0,
+        records: [],
+      };
+
+      const attendancePercentage =
+        stats.totalMarked > 0
+          ? Number(
+            (
+              ((stats.presentCount + stats.lateCount) / stats.totalMarked) *
+              100
+            ).toFixed(1)
+          )
+          : 0;
+
+      playerObj.attendance = {
+        presentCount: stats.presentCount,
+        absentCount: stats.absentCount,
+        lateCount: stats.lateCount,
+        totalMarkedSessions: stats.totalMarked,
+        attendancePercentage,
+        records: stats.records,
+      };
+
+      return playerObj;
+    });
+
+    let sessions = [];
+    if (cls.term) {
+      sessions = generateClassSessions(cls.term, cls);
+    }
+
+    const formattedSessions = sessions.map((date) => {
+      const dateStr = dateOnly(date, "sessionDate");
+      const attDoc = attendanceRecords.find(
+        (att) =>
+          att.sessionDate &&
+          dateOnly(att.sessionDate, "attendance.sessionDate") === dateStr
+      );
+
+      return {
+        date: dateStr,
+        day: date.getUTCDate(),
+        month: date.getUTCMonth() + 1,
+        year: date.getUTCFullYear(),
+        isAttendanceMarked: Boolean(attDoc),
+        attendance: attDoc
+          ? {
+            attendanceId: attDoc._id,
+            markedBy: attDoc.markedBy,
+            totalMarkedPlayers: attDoc.records ? attDoc.records.length : 0,
+          }
+          : null,
+      };
+    });
+
+    const broadcastRoom = await ChatRoom.findOne({
+      classId: cls._id,
+      type: "BROADCAST",
+    }).select("_id");
+
+    const roomId = broadcastRoom ? broadcastRoom._id : null;
+
+    res.json({
+      success: true,
+      data: {
+        classId: cls._id,
+        className: cls.name,
+        chatRoomId: roomId,
+        broadcastChatRoomId: roomId,
+        broadcastRoomId: roomId,
+        dayOfWeek: cls.dayOfWeek,
+        startTime: cls.startTime,
+        endTime: cls.endTime,
+        venue: cls.venue || cls.location || "",
+        location: cls.location || "",
+        sessionDuration: cls.sessionDuration,
+        trainingType: cls.trainingType,
+        capacity: cls.capacity,
+        equipmentRequired: cls.equipmentRequired,
+        term: cls.term,
+        program: cls.program,
+        category: cls.category,
+        coach: cls.coach,
+        assistantCoach: cls.assistantCoach,
+        totalPlayers: enrichedPlayers.length,
+        players: enrichedPlayers,
+        totalSessions: formattedSessions.length,
+        sessions: formattedSessions,
+        attendanceRecords,
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+exports.getMyAssignedTeams = async (req, res) => {
+  try {
+    const coachId = req.admin._id;
+    let { page = 1, limit = 20, search = "" } = req.query;
+
+    page = Number(page);
+    limit = Number(limit);
+
+    const query = {
+      $or: [{ coach: coachId }, { assistantCoach: coachId }],
+    };
+
+    if (search) {
+      query.teamName = { $regex: search, $options: "i" };
+    }
+
+    const total = await Team.countDocuments(query);
+
+    const teams = await Team.find(query)
+      .populate("coach", "name email")
+      .populate("assistantCoach", "name email")
+      .populate("players", "fullName profileImage dob")
+      .populate("captain", "fullName")
+      .populate("viceCaptain", "fullName")
+      .sort({ createdAt: -1 })
+      .skip((page - 1) * limit)
+      .limit(limit);
+
+    res.json({
+      success: true,
+      message: "Assigned teams fetched successfully",
+      totalTeams: total,
+      page,
+      limit,
+      totalPages: Math.ceil(total / limit),
+      data: teams,
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+exports.getPlayerProfile = async (req, res) => {
+  try {
+    const coachId = req.admin._id;
+    const { playerId } = req.params;
+
+    if (!mongoose.Types.ObjectId.isValid(playerId)) {
+      return res.status(400).json({ success: false, message: "Invalid player ID" });
+    }
+
+    if (req.admin.role === "COACH") {
+      const assignedClasses = await Class.find({
+        $or: [{ coach: coachId }, { assistantCoach: coachId }],
+        players: playerId,
+      }).select("_id");
+
+      if (assignedClasses.length === 0) {
+        return res.status(403).json({
+          success: false,
+          message: "Access denied. Player is not in your assigned classes.",
+        });
+      }
+    }
+
+    const player = await User.findById(playerId)
+      .populate({
+        path: "parentId",
+        select: "fullName email phone address city state postcode country emergencyContact relationship",
+      })
+      .populate("category", "name ageRange")
+      .populate("programs", "name ageGroup")
+      .populate("term", "name year")
+      .populate("assignedClasses", "name dayOfWeek startTime endTime venue location")
+      .lean();
+
+    if (!player) {
+      return res.status(404).json({ success: false, message: "Player not found" });
+    }
+
+    const medicalProfile = await MedicalProfile.findOne({ player: playerId }).lean();
+
+    const teams = await Team.find({ "players.player": playerId })
+      .select("teamName ageGroup coach")
+      .populate("coach", "name")
+      .lean();
+    const attendanceRecords = await Attendance.find({
+      "records.player": playerId,
+    })
+      .select("class sessionDate records")
+      .populate("class", "name dayOfWeek")
+      .sort({ sessionDate: -1 })
+      .limit(50)
+      .lean();
+
+    const attendanceHistory = attendanceRecords.map((att) => {
+      const playerRecord = att.records.find(
+        (r) => r.player.toString() === playerId
+      );
+      return {
+        classId: att.class?._id,
+        className: att.class?.name,
+        sessionDate: att.sessionDate,
+        status: playerRecord?.status || "NOT_MARKED",
+        note: playerRecord?.note || playerRecord?.reason || playerRecord?.remarks || playerRecord?.comment || "",
+        comment: playerRecord?.comment || "",
+        remarks: playerRecord?.remarks || "",
+      };
+    });
+
+    const coachNotes = await CoachNote.find({ player: playerId })
+      .populate("coach", "name")
+      .populate("classId", "name")
+      .sort({ createdAt: -1 })
+      .lean();
+
+    const currentAge = ageGroupForYear(player.dob);
+
+    const medicalAlerts = {
+      hasMedicalCondition: player.isMedicalCondition || false,
+      medicalConditionDetails: player.medicalConditionDetails || "",
+      allergies: medicalProfile?.allergies || [],
+      injuries: medicalProfile?.injuries || [],
+      medications: medicalProfile?.medications || [],
+      medicalConditions: medicalProfile?.medicalConditions || "",
+      emergencyContact: player.parentId?.emergencyContact || medicalProfile?.emergencyContact || "",
+    };
+
+    res.json({
+      success: true,
+      data: {
+        medicalAlerts,
+        player: {
+          _id: player._id,
+          fullName: player.fullName,
+          firstName: player.firstName,
+          lastName: player.lastName,
+          profileImage: player.profileImage,
+          dob: player.dob,
+          currentAge,
+          ageGroup: currentAge === null ? null : `U${currentAge}`,
+          ageGroupYear: ageGroupContextYear(),
+          gender: player.gender,
+          club: player.club,
+          jerseyNumber: player.jerseyNumber,
+          prefferedFoot: player.prefferedFoot,
+          rating: player.rating,
+          joinedDate: player.joinedDate,
+          isMedicalCondition: player.isMedicalCondition,
+          medicalConditionDetails: player.medicalConditionDetails,
+        },
+
+        parent: player.parentId,
+
+        category: player.category,
+        programs: player.programs,
+        term: player.term,
+        assignedClasses: player.assignedClasses,
+        teams,
+
+        attendanceHistory,
+        attendanceSummary: {
+          total: attendanceHistory.length,
+          present: attendanceHistory.filter((a) => a.status === "PRESENT").length,
+          absent: attendanceHistory.filter((a) => a.status === "ABSENT").length,
+          late: attendanceHistory.filter((a) => a.status === "LATE").length,
+          trial: attendanceHistory.filter((a) => a.status === "TRIAL").length,
+        },
+
+        coachNotes,
+
+        medicalProfile,
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+exports.getClassPlayers = async (req, res) => {
+  try {
+    const { classId } = req.params;
+
+    const classData = await Class.findById(classId)
+      .populate({
+        path: "players",
+        select: "fullName profileImage dob gender isMedicalCondition medicalConditionDetails parentId rating",
+        populate: {
+          path: "parentId",
+          select: "fullName phone email emergencyContact",
+        },
+      })
+      .populate("coach", "name email")
+      .populate("term", "name year");
+
+    if (!classData) {
+      return res.status(404).json({ success: false, message: "Class not found" });
+    }
+
+    const players = classData.players.map((p) => ({
+      _id: p._id,
+      fullName: p.fullName,
+      profileImage: p.profileImage,
+      dob: p.dob,
+      gender: p.gender,
+      rating: p.rating,
+      hasMedicalAlert: p.isMedicalCondition || false,
+      medicalConditionDetails: p.medicalConditionDetails || "",
+      parent: p.parentId
+        ? {
+          _id: p.parentId._id,
+          fullName: p.parentId.fullName,
+          phone: p.parentId.phone,
+          email: p.parentId.email,
+          emergencyContact: p.parentId.emergencyContact,
+        }
+        : null,
+    }));
+
+    res.json({
+      success: true,
+      data: {
+        classId: classData._id,
+        className: classData.name,
+        coach: classData.coach,
+        term: classData.term,
+        totalPlayers: players.length,
+        players,
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+exports.getUniquePlayersByCoach = async (req, res) => {
+  try {
+    const coachId = req.params.coachId || req.query.coachId || req.admin?._id;
+    if (req.admin?.role === "COACH" && String(coachId) !== String(req.admin._id)) return res.status(403).json({ success: false, message: "You may only access your own players" });
+    let { page = 1, limit = 10, search = "" } = req.query;
+
+    page = Number(page);
+    limit = Number(limit);
+
+    if (!coachId) {
+      return res.status(400).json({
+        success: false,
+        message: "coachId is required",
+      });
+    }
+
+    const coachClasses = await Class.find({
+      $or: [{ coach: coachId }, { assistantCoach: coachId }],
+      status: "ACTIVE",
+    }).select("players");
+
+    const playerIdsSet = new Set();
+    coachClasses.forEach((cls) => {
+      (cls.players || []).forEach((pId) => {
+        if (pId) playerIdsSet.add(pId.toString());
+      });
+    });
+
+    const playerIds = Array.from(playerIdsSet);
+
+    const query = {
+      _id: { $in: playerIds },
+    };
+
+    if (search) {
+      const searchCriteria = [
+        { fullName: { $regex: search, $options: "i" } },
+        { firstName: { $regex: search, $options: "i" } },
+        { lastName: { $regex: search, $options: "i" } },
+      ];
+      query.$or = searchCriteria;
+    }
+
+    const total = await User.countDocuments(query);
+
+    const users = await User.find(query)
+      .populate("parentId", "fullName email phone address city state postcode country emergencyContact relationship")
+      .populate("category", "name")
+      .populate("programs", "name")
+      .populate({
+        path: "assignedClasses",
+        populate: [
+          { path: "term", select: "name year" },
+          { path: "coach", select: "fullName email" },
+          { path: "program", select: "name" },
+          { path: "category", select: "name" },
+        ],
+      })
+      .select("-password -tokens")
+      .sort({ createdAt: -1 })
+      .skip((page - 1) * limit)
+      .limit(limit);
+
+    res.json({
+      success: true,
+      page,
+      limit,
+      total,
+      totalPages: Math.ceil(total / limit),
+      users,
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+
+exports.getPlayerDetails = async (req, res) => {
+  try {
+    const { playerId } = req.params;
+
+    if (!mongoose.Types.ObjectId.isValid(playerId)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid player ID",
+      });
+    }
+
+    const player = await User.findById(playerId)
+      .populate({
+        path: "parentId",
+        select: "-password -tokens -otp -otpExpire -__v",
+      })
+      .populate("category", "name")
+      .populate("programs", "name")
+      .populate("term", "name")
+      .populate("assignedClasses", "name")
+      .lean();
+
+    if (!player) {
+      return res.status(404).json({
+        success: false,
+        message: "Player not found",
+      });
+    }
+
+    const attendanceRecords = await Attendance.find({
+      "records.player": playerId,
+    })
+      .populate("class", "name dayOfWeek startTime endTime")
+      .sort({ sessionDate: -1 })
+      .lean();
+
+    const perDayAttendance = attendanceRecords.map((att) => {
+      const playerRecord = att.records.find(
+        (r) => r.player && r.player.toString() === playerId.toString()
+      );
+      return {
+        attendanceId: att._id,
+        class: att.class,
+        sessionDate: att.sessionDate,
+        status: playerRecord?.status || "NOT_MARKED",
+        note: playerRecord?.note || playerRecord?.reason || playerRecord?.remarks || playerRecord?.comment || "",
+        comment: playerRecord?.comment || "",
+        remarks: playerRecord?.remarks || "",
+        reason: playerRecord?.reason || "",
+        markedByParent: playerRecord?.markedByParent || false,
+        lateArrival: playerRecord?.lateArrival || false,
+        attendanceType: playerRecord?.attendanceType || "REGULAR",
+      };
+    });
+
+    const totalSessions = perDayAttendance.length;
+    const presentCount = perDayAttendance.filter((a) => a.status === "PRESENT").length;
+    const absentCount = perDayAttendance.filter((a) => a.status === "ABSENT").length;
+    const lateCount = perDayAttendance.filter((a) => a.status === "LATE").length;
+    const trialCount = perDayAttendance.filter((a) => a.status === "TRIAL").length;
+    const attendedCount = presentCount + lateCount;
+
+    const overallAttendancePercentage =
+      totalSessions > 0
+        ? Number(((attendedCount / totalSessions) * 100).toFixed(2))
+        : 0;
+
+    const overallAttendance = {
+      totalSessions,
+      presentCount,
+      absentCount,
+      lateCount,
+      trialCount,
+      attendedCount,
+      percentage: overallAttendancePercentage,
+    };
+
+    const { isPersonal } = req.query;
+
+    const coachNotesQuery = {
+      player: playerId,
+      $or: [
+        { isPersonal: false },
+        { coach: req.admin._id }
+      ]
+    };
+    if (isPersonal !== undefined && isPersonal !== "") {
+      coachNotesQuery.isPersonal = isPersonal === "true";
+    }
+
+    const coachNotes = await CoachNote.find(coachNotesQuery)
+      .populate("coach", "name email")
+      .populate("classId", "name")
+      .sort({ createdAt: -1 })
+      .lean();
+
+    const classPaymentStatuses = player.classPaymentStatuses || [];
+    const assignedClassesPaymentInfo = (player.assignedClasses || []).map((cls) => {
+      const classIdStr = cls._id ? cls._id.toString() : cls.toString();
+      const className = cls.name || "";
+      const paymentEntry = classPaymentStatuses.find((cps) => {
+        const cpsClassId = cps.class
+          ? cps.class._id
+            ? cps.class._id.toString()
+            : cps.class.toString()
+          : null;
+        return cpsClassId === classIdStr;
+      });
+      const status = paymentEntry ? paymentEntry.paymentStatus : "TRIAL";
+      return {
+        classId: cls._id || cls,
+        className,
+        paymentStatus: status,
+      };
+    });
+
+    const paidClasses = assignedClassesPaymentInfo.filter((item) => item.paymentStatus === "PAID");
+    const unpaidClasses = assignedClassesPaymentInfo.filter((item) => item.paymentStatus === "UNPAID");
+    const trialClasses = assignedClassesPaymentInfo.filter((item) => item.paymentStatus === "TRIAL");
+    const overdueClasses = assignedClassesPaymentInfo.filter((item) => item.paymentStatus === "OVER_DUE");
+
+    const classPaymentSummary = {
+      totalAssignedClasses: assignedClassesPaymentInfo.length,
+      paidClassesCount: paidClasses.length,
+      unpaidClassesCount: unpaidClasses.length,
+      trialClassesCount: trialClasses.length,
+      overdueClassesCount: overdueClasses.length,
+      isAllClassesPaid:
+        assignedClassesPaymentInfo.length > 0 &&
+        paidClasses.length === assignedClassesPaymentInfo.length,
+      paidClassNames: paidClasses.map((c) => c.className),
+      unpaidClassNames: unpaidClasses.map((c) => c.className),
+      trialClassNames: trialClasses.map((c) => c.className),
+      overdueClassNames: overdueClasses.map((c) => c.className),
+      assignedClassesWithPaymentStatus: assignedClassesPaymentInfo,
+    };
+
+    const assignedTeams = await Team.find({ "players.player": playerId })
+      .select("teamName teamFee logo players ageGroup")
+      .lean();
+
+    const assignedTeamsPaymentInfo = assignedTeams.map((team) => {
+      const pEntry = (team.players || []).find(
+        (p) => p.player && p.player.toString() === playerId.toString()
+      );
+      return {
+        teamId: team._id,
+        teamName: team.teamName,
+        teamFee: team.teamFee || 0,
+        paymentStatus: pEntry ? pEntry.paymentStatus : "UNPAID",
+      };
+    });
+
+    const paidTeams = assignedTeamsPaymentInfo.filter((item) => item.paymentStatus === "PAID");
+    const unpaidTeams = assignedTeamsPaymentInfo.filter((item) => item.paymentStatus === "UNPAID");
+    const trialTeams = assignedTeamsPaymentInfo.filter((item) => item.paymentStatus === "TRIAL");
+    const overdueTeams = assignedTeamsPaymentInfo.filter((item) => item.paymentStatus === "OVER_DUE");
+
+    const teamPaymentSummary = {
+      totalAssignedTeams: assignedTeamsPaymentInfo.length,
+      paidTeamsCount: paidTeams.length,
+      unpaidTeamsCount: unpaidTeams.length,
+      trialTeamsCount: trialTeams.length,
+      overdueTeamsCount: overdueTeams.length,
+      isAllTeamsPaid:
+        assignedTeamsPaymentInfo.length > 0 &&
+        paidTeams.length === assignedTeamsPaymentInfo.length,
+      paidTeamNames: paidTeams.map((t) => t.teamName),
+      unpaidTeamNames: unpaidTeams.map((t) => t.teamName),
+      trialTeamNames: trialTeams.map((t) => t.teamName),
+      overdueTeamNames: overdueTeams.map((t) => t.teamName),
+      assignedTeamsWithPaymentStatus: assignedTeamsPaymentInfo,
+    };
+
+    const teamAttendanceRecords = await Attendance.find({
+      team: { $exists: true, $ne: null },
+      "records.player": playerId,
+    })
+      .populate("team", "teamName ageGroup startTime endTime")
+      .sort({ sessionDate: -1 })
+      .lean();
+
+    const perDayTeamAttendance = teamAttendanceRecords.map((att) => {
+      const playerRecord = att.records.find(
+        (r) => r.player && r.player.toString() === playerId.toString()
+      );
+      return {
+        attendanceId: att._id,
+        team: att.team,
+        teamName: att.team?.teamName || "",
+        sessionDate: att.sessionDate,
+        status: playerRecord?.status || "NOT_MARKED",
+        note: playerRecord?.note || playerRecord?.reason || playerRecord?.remarks || playerRecord?.comment || "",
+        comment: playerRecord?.comment || "",
+        remarks: playerRecord?.remarks || "",
+        reason: playerRecord?.reason || "",
+        markedByParent: playerRecord?.markedByParent || false,
+        lateArrival: playerRecord?.lateArrival || false,
+        attendanceType: playerRecord?.attendanceType || "REGULAR",
+      };
+    });
+
+    const totalTeamSessions = perDayTeamAttendance.length;
+    const presentTeamCount = perDayTeamAttendance.filter((a) => a.status === "PRESENT").length;
+    const absentTeamCount = perDayTeamAttendance.filter((a) => a.status === "ABSENT").length;
+    const lateTeamCount = perDayTeamAttendance.filter((a) => a.status === "LATE").length;
+    const trialTeamCount = perDayTeamAttendance.filter((a) => a.status === "TRIAL").length;
+    const attendedTeamCount = presentTeamCount + lateTeamCount;
+
+    const overallTeamAttendancePercentage =
+      totalTeamSessions > 0
+        ? Number(((attendedTeamCount / totalTeamSessions) * 100).toFixed(2))
+        : 0;
+
+    const overallTeamAttendance = {
+      totalSessions: totalTeamSessions,
+      presentCount: presentTeamCount,
+      absentCount: absentTeamCount,
+      lateCount: lateTeamCount,
+      trialCount: trialTeamCount,
+      attendedCount: attendedTeamCount,
+      percentage: overallTeamAttendancePercentage,
+    };
+
+    return res.status(200).json({
+      success: true,
+      message: "Player details fetched successfully.",
+      data: {
+        player,
+        parent: player.parentId || null,
+        assignedClassesPaymentInfo,
+        classPaymentSummary,
+        assignedTeamsPaymentInfo,
+        teamPaymentSummary,
+        perDayAttendance,
+        overallAttendance,
+        perDayTeamAttendance,
+        overallTeamAttendance,
+        coachNotes,
+      },
+    });
+  } catch (error) {
+    return res.status(500).json({
+      success: false,
+      message: error.message,
+    });
+  }
+};
+
+exports.getCoachDashboard = async (req, res) => {
+  try {
+    const coachId = req.admin._id;
+
+    const coach = await Admin.findById(coachId).select(
+      "name email mobile profileImage role"
+    );
+    if (!coach) {
+      return res
+        .status(404)
+        .json({ success: false, message: "Coach profile not found" });
+    }
+
+    const today = new Date();
+    today.setUTCHours(0, 0, 0, 0);
+
+    const endOfToday = new Date(today);
+    endOfToday.setUTCHours(23, 59, 59, 999);
+
+    const currentDayIdx = today.getUTCDay();
+    const diffToMonday = currentDayIdx === 0 ? -6 : 1 - currentDayIdx;
+
+    const weekStart = new Date(today);
+    weekStart.setUTCDate(today.getUTCDate() + diffToMonday);
+    weekStart.setUTCHours(0, 0, 0, 0);
+
+    const weekEnd = new Date(weekStart);
+    weekEnd.setUTCDate(weekStart.getUTCDate() + 6);
+    weekEnd.setUTCHours(23, 59, 59, 999);
+
+    const [
+      assignedClasses,
+      assignedTeams,
+      coachNotesCount,
+      tempPlayersCount,
+      unreadNotificationsCount,
+      recentNotes,
+      recentNotifications,
+      todayAttendanceDocs,
+    ] = await Promise.all([
+      Class.find({
+        $or: [{ coach: coachId }, { assistantCoach: coachId }],
+        status: "ACTIVE",
+      })
+        .populate("term", "name startDate endDate year")
+        .populate("program", "name ageGroup")
+        .populate("category", "name ageRange")
+        .populate("players", "fullName profileImage dob"),
+
+      Team.find({
+        $or: [{ coach: coachId }, { assistantCoach: coachId }],
+      }).populate("players", "fullName profileImage"),
+
+      CoachNote.countDocuments({ coach: coachId }),
+
+      User.countDocuments({ createdBy: coachId }),
+
+      Notification.countDocuments({
+        recipientType: { $in: ["ADMIN", "ALL", "COACH"] },
+        admin: coachId,
+        isRead: false,
+      }),
+
+      CoachNote.find({ coach: coachId })
+        .populate("player", "fullName profileImage")
+        .populate("classId", "name")
+        .sort({ createdAt: -1 })
+        .limit(5),
+
+      Notification.find({
+        recipientType: { $in: ["ADMIN", "ALL", "COACH"] },
+        admin: coachId,
+      })
+        .sort({ createdAt: -1 })
+        .limit(5),
+
+      Attendance.find({
+        sessionDate: { $gte: today, $lte: endOfToday },
+      }),
+    ]);
+
+    const classIds = assignedClasses.map((cls) => cls._id);
+    const chatRooms = await ChatRoom.find({
+      classId: { $in: classIds },
+      type: "BROADCAST",
+    }).select("_id classId");
+
+    const chatRoomMap = {};
+    chatRooms.forEach((room) => {
+      if (room.classId) {
+        chatRoomMap[room.classId.toString()] = room._id;
+      }
+    });
+
+    const uniquePlayerIds = new Set();
+    assignedClasses.forEach((cls) => {
+      (cls.players || []).forEach((p) => uniquePlayerIds.add(p._id.toString()));
+    });
+    assignedTeams.forEach((team) => {
+      (team.players || []).forEach((p) => uniquePlayerIds.add(p._id.toString()));
+    });
+
+    const todaysClasses = [];
+    const upcomingSessions = [];
+    let thisWeekSessionsCount = 0;
+
+    for (const cls of assignedClasses) {
+      if (!cls.term) continue;
+
+      const sessions = generateClassSessions(cls.term, cls);
+
+      const weekSessions = sessions.filter(
+        (s) => s >= weekStart && s <= weekEnd
+      );
+      thisWeekSessionsCount += weekSessions.length;
+
+      const isTodaySession = sessions.some((s) => {
+        const d = dateOnlyStartUtc(s, "sessionDate");
+        return d.getTime() === today.getTime();
+      });
+
+      const roomId = chatRoomMap[cls._id.toString()] || null;
+
+      if (isTodaySession) {
+        const attDoc = todayAttendanceDocs.find(
+          (att) => att.class.toString() === cls._id.toString()
+        );
+
+        const todayTimes = getSessionTimesForDateCoach(cls, today);
+
+        todaysClasses.push({
+          classId: cls._id,
+          className: cls.name,
+          chatRoomId: roomId,
+          broadcastChatRoomId: roomId,
+          broadcastRoomId: roomId,
+          dayOfWeek: cls.dayOfWeek,
+          startTime: todayTimes.startTime,
+          endTime: todayTimes.endTime,
+          venue: cls.venue || cls.location || "",
+          location: cls.location || "",
+          program: cls.program,
+          category: cls.category,
+          totalPlayers: cls.players ? cls.players.length : 0,
+          sessionDate: dateOnly(today, "sessionDate"),
+          isAttendanceMarked: Boolean(attDoc),
+          attendanceId: attDoc ? attDoc._id : null,
+          scheduleType: cls.scheduleType || "SINGLE_DAY",
+          schedule: cls.schedule || [],
+        });
+      }
+
+      sessions.forEach((sDate) => {
+        const sTime = dateOnlyStartUtc(sDate, "sessionDate");
+        if (sTime >= today) {
+          const attDoc = todayAttendanceDocs.find(
+            (att) =>
+              att.class.toString() === cls._id.toString() &&
+              dateOnly(att.sessionDate, "attendance.sessionDate") ===
+              dateOnly(sDate, "sessionDate")
+          );
+
+          const sessionTimes = getSessionTimesForDateCoach(cls, sDate);
+
+          upcomingSessions.push({
+            classId: cls._id,
+            className: cls.name,
+            chatRoomId: roomId,
+            broadcastChatRoomId: roomId,
+            broadcastRoomId: roomId,
+            sessionDate: dateOnly(sDate, "sessionDate"),
+            dayOfWeek: cls.dayOfWeek,
+            startTime: sessionTimes.startTime,
+            endTime: sessionTimes.endTime,
+            venue: cls.venue || cls.location || "",
+            programName: cls.program ? cls.program.name : "",
+            categoryName: cls.category ? cls.category.name : "",
+            isAttendanceMarked: Boolean(attDoc),
+          });
+        }
+      });
+    }
+
+    upcomingSessions.sort(
+      (a, b) => new Date(a.sessionDate) - new Date(b.sessionDate)
+    );
+    const nextUpcomingSessions = upcomingSessions.slice(0, 5);
+
+    const pendingAttendanceTodayCount = todaysClasses.filter(
+      (c) => !c.isAttendanceMarked
+    ).length;
+
+    res.json({
+      success: true,
+      message: "Coach dashboard overview fetched successfully",
+      data: {
+        coach: {
+          coachId: coach._id,
+          name: coach.name,
+          email: coach.email,
+          mobile: coach.mobile,
+          profileImage: coach.profileImage,
+          role: coach.role,
+        },
+        stats: {
+          totalAssignedClasses: assignedClasses.length,
+          totalAssignedTeams: assignedTeams.length,
+          totalUniquePlayers: uniquePlayerIds.size,
+          todaysClassesCount: todaysClasses.length,
+          thisWeekSessionsCount,
+          pendingAttendanceTodayCount,
+          totalNotesCreated: coachNotesCount,
+          totalTemporaryPlayers: tempPlayersCount,
+          unreadNotificationsCount,
+        },
+        todaysClasses,
+        upcomingSessions: nextUpcomingSessions,
+        recentNotes,
+        recentNotifications,
+        assignedClassesSummary: assignedClasses.map((cls) => {
+          const roomId = chatRoomMap[cls._id.toString()] || null;
+          return {
+            classId: cls._id,
+            className: cls.name,
+            chatRoomId: roomId,
+            broadcastChatRoomId: roomId,
+            broadcastRoomId: roomId,
+            dayOfWeek: cls.dayOfWeek,
+            startTime: cls.startTime,
+            endTime: cls.endTime,
+            venue: cls.venue || cls.location || "",
+            program: cls.program ? cls.program.name : "",
+            category: cls.category ? cls.category.name : "",
+            totalPlayers: cls.players ? cls.players.length : 0,
+          };
+        }),
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+};

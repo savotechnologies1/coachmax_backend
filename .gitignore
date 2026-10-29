@@ -1,0 +1,12 @@
+node_modules/
+uploads/
+*.log
+coverage/
+.test-tmp/
+
+.env
+
+
+.env.*
+!.env.example
+/config/serviceAccountKey.json

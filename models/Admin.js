@@ -1,0 +1,52 @@
+const mongoose = require("mongoose");
+
+const adminSchema = new mongoose.Schema(
+    {
+        name: String,
+
+        email: {
+            type: String,
+            unique: true,
+            required: true,
+        },
+
+        mobile: {
+            type: String,
+            unique: true,
+            required: true,
+        },
+        profileImage: { type: String, default: null },
+        otp: String,
+        otpExpire: Date,
+        isOtpVerified: { type: Boolean, default: false },
+        otpAttempts: { type: Number, default: 0 },
+        resetTokenHash: { type: String, select: false },
+        resetTokenExpire: { type: Date, select: false },
+        password: {
+            type: String,
+            required: true,
+        },
+        tokens: [
+            {
+                type: String,
+            }
+        ],
+        fcmTokens: [
+            {
+                type: String,
+            }
+        ],
+        role: {
+            type: String,
+            enum: ["SUPER_ADMIN", "COACH"],
+            default: "COACH",
+        },
+        isActive: {
+            type: Boolean,
+            default: true,
+        },
+    },
+    { timestamps: true }
+);
+
+module.exports = mongoose.model("Admin", adminSchema);

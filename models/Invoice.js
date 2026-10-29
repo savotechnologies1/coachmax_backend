@@ -1,0 +1,129 @@
+const mongoose = require("mongoose");
+
+const invoiceItemSchema = new mongoose.Schema({
+  title: {
+    type: String,
+    required: true,
+  },
+  description: {
+    type: String,
+    default: "",
+  },
+  amount: {
+    type: Number,
+    required: true,
+    default: 0,
+  },
+});
+
+const invoiceSchema = new mongoose.Schema(
+  {
+    // Internal sequence documents share the existing invoices collection so
+    // invoice generation does not need a new MongoDB namespace.
+    internalType: { type: String, default: "INVOICE" },
+    chargeKey: { type: String },
+    invoiceNumber: {
+      type: String,
+      unique: true,
+      required: true,
+    },
+    parent: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Parent",
+      required: true,
+    },
+    players: [
+      {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "User",
+      },
+    ],
+    items: [invoiceItemSchema],
+    subtotal: {
+      type: Number,
+      default: 0,
+    },
+    discount: {
+      type: Number,
+      default: 0,
+    },
+    totalAmount: {
+      type: Number,
+      required: true,
+      default: 0,
+    },
+    amount: {
+      type: Number,
+      default: 0,
+    },
+    class: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Class",
+    },
+    team: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Team",
+    },
+    league: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "League",
+    },
+    event: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Event",
+    },
+    eventRegistration: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "EventRegistration",
+    },
+    dueDate: {
+      type: Date,
+      required: true,
+    },
+    type: {
+      type: String,
+      enum: ["ACADEMY_FEE", "TOURNAMENT_FEE", "CAMP_FEE", "STORE_ORDER", "CUSTOM", "CLASS_FEE", "TEAM_FEE"],
+      default: "CUSTOM",
+    },
+    description: {
+      type: String,
+      default: "",
+    },
+    notes: {
+      type: String,
+      default: "",
+    },
+    paymentMethod: {
+      type: String,
+      enum: ["ONLINE", "COD", null],
+      default: null,
+    },
+    paymentStatus: {
+      type: String,
+      enum: ["UNPAID", "PAYMENT_PENDING", "PAID", "REJECTED", "CANCELLED"],
+      default: "UNPAID",
+    },
+    status: {
+      type: String,
+      enum: ["ACTIVE", "CANCELLED"],
+      default: "ACTIVE",
+    },
+    verifiedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Admin",
+    },
+    verifiedAt: {
+      type: Date,
+    },
+  },
+  { timestamps: true }
+);
+
+// Keep the internal yearly sequence document invisible to normal invoice
+// reads and counts. Existing invoices have no internalType and remain visible.
+invoiceSchema.pre(["find", "findOne", "countDocuments"], function excludeInternalSequence() {
+  this.where({ internalType: { $ne: "INVOICE_COUNTER" } });
+});
+
+invoiceSchema.index({ chargeKey: 1 }, { unique: true, partialFilterExpression: { chargeKey: { $type: "string" }, status: "ACTIVE" } });
+module.exports = mongoose.model("Invoice", invoiceSchema);
