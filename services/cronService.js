@@ -8,7 +8,12 @@ const { processDeliveryJobs } = require("./deliveryService");
 async function completeExpiredEvents(now = new Date()) {
   // Completion preserves registrations, attendance, invoices and linked media.
   const today = dateOnlyStartUtc(todayDateOnly(DEFAULT_TIMEZONE, now));
-  return Event.updateMany({ endDate: { $lt: today }, status: { $ne: "COMPLETED" } }, { $set: { status: "COMPLETED", isRegistrationOpen: false } });
+  return Event.updateMany({
+    startDate: { $type: "date" },
+    endDate: { $type: "date", $lt: today },
+    $expr: { $lte: ["$startDate", "$endDate"] },
+    status: { $ne: "COMPLETED" },
+  }, { $set: { status: "COMPLETED", isRegistrationOpen: false } });
 }
 function initCronJobs() {
   const jobs = [];
