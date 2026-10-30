@@ -13,6 +13,7 @@ const { activateAssignedPlayers } = require("../services/activateAssignedPlayers
 const fs = require("fs");
 const path = require("path");
 const mongoose = require("mongoose");
+const { removeStoredUpload } = require("../utils/upload");
 const {
   DEFAULT_TIMEZONE,
   dateOnly,
@@ -131,6 +132,19 @@ async function resolveEventTermId({ requestedTermId, startDate, endDate, eventTy
   return matchingTerm?._id || null;
 }
 
+function isEventDateRangeReversed(startDate, endDate) {
+  return Boolean(startDate && endDate && dateOnly(startDate, "startDate") > dateOnly(endDate, "endDate"));
+}
+
+async function discardRejectedEventImage(file) {
+  if (!file?.filename) return;
+  try {
+    await removeStoredUpload(`uploads/eventImg/${file.filename}`);
+  } catch (error) {
+    console.error("Could not remove rejected event image:", error);
+  }
+}
+
 exports.createEvent = async (req, res) => {
   try {
     let bannerImage = null;
@@ -152,6 +166,13 @@ exports.createEvent = async (req, res) => {
     if (bodyData.endDate) bodyData.endDate = dateOnlyToUtc(bodyData.endDate, "endDate");
     if (isDateOnly(bodyData.registrationDeadline)) {
       bodyData.registrationDeadline = dateOnlyToUtc(bodyData.registrationDeadline, "registrationDeadline");
+    }
+    if (isEventDateRangeReversed(bodyData.startDate, bodyData.endDate)) {
+      await discardRejectedEventImage(req.file);
+      return res.status(400).json({
+        success: false,
+        message: "End date must be on or after start date",
+      });
     }
     if (bodyData.termId === "") delete bodyData.termId;
     bodyData.termId = await resolveEventTermId({
@@ -221,15 +242,22 @@ exports.getAllEventsForAdmin = async (req, res) => {
 
     // Keep persisted statuses aligned with the event's Australia calendar dates.
     await Event.updateMany(
-      { isArchived: { $ne: true }, endDate: { $lt: dateOnlyStartUtc(today) }, status: { $ne: "COMPLETED" } },
+      {
+        isArchived: { $ne: true },
+        startDate: { $type: "date" },
+        endDate: { $type: "date", $lt: dateOnlyStartUtc(today) },
+        $expr: { $lte: ["$startDate", "$endDate"] },
+        status: { $ne: "COMPLETED" },
+      },
       { $set: { status: "COMPLETED", isRegistrationOpen: false } }
     );
     await Event.updateMany(
       {
         isArchived: { $ne: true },
         status: "UPCOMING",
-        startDate: { $lte: dateOnlyEndUtc(today) },
-        endDate: { $gte: dateOnlyStartUtc(today) },
+        startDate: { $type: "date", $lte: dateOnlyEndUtc(today) },
+        endDate: { $type: "date", $gte: dateOnlyStartUtc(today) },
+        $expr: { $lte: ["$startDate", "$endDate"] },
       },
       { $set: { status: "ONGOING" } }
     );
@@ -453,13 +481,15 @@ exports.updateEvent = async (req, res) => {
       });
     }
 
-    if (updates.startDate && updates.endDate) {
-      if (dateOnly(updates.startDate, "startDate") > dateOnly(updates.endDate, "endDate")) {
-        return res.status(400).json({
-          success: false,
-          message: "Start date cannot be after end date",
-        });
-      }
+    if ((updates.startDate || updates.endDate) && isEventDateRangeReversed(
+      updates.startDate || event.startDate,
+      updates.endDate || event.endDate
+    )) {
+      await discardRejectedEventImage(req.file);
+      return res.status(400).json({
+        success: false,
+        message: "End date must be on or after start date",
+      });
     }
 
     if (updates.registrationDeadline && updates.startDate) {
