@@ -29,11 +29,18 @@ jobs:
           DEPLOY_HOST: ${{ vars.DEPLOY_HOST || '50.6.44.47' }}
           DEPLOY_PORT: ${{ vars.DEPLOY_PORT || '22' }}
           DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_SSH_KEY_B64: ${{ secrets.DEPLOY_SSH_KEY_B64 }}
         run: |
-          test -n "$DEPLOY_SSH_KEY" || { echo "Missing DEPLOY_SSH_KEY secret"; exit 1; }
           install -m 700 -d ~/.ssh
-          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
+          if [ -n "$DEPLOY_SSH_KEY_B64" ]; then
+            printf '%s' "$DEPLOY_SSH_KEY_B64" | base64 --decode > ~/.ssh/id_ed25519
+          elif [ -n "$DEPLOY_SSH_KEY" ]; then
+            printf '%s\n' "$DEPLOY_SSH_KEY" | tr -d '\r' > ~/.ssh/id_ed25519
+          else
+            echo "Missing DEPLOY_SSH_KEY_B64 Actions secret"; exit 1
+          fi
           chmod 600 ~/.ssh/id_ed25519
+          ssh-keygen -y -f ~/.ssh/id_ed25519 >/dev/null || { echo "SSH key secret is invalid; update DEPLOY_SSH_KEY_B64 with the Base64 of the complete private key"; exit 1; }
           ssh-keyscan -p "$DEPLOY_PORT" -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
           chmod 600 ~/.ssh/known_hosts
       - name: Upload application
