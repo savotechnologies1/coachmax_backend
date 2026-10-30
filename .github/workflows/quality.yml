@@ -59,6 +59,6 @@ jobs:
           PM2_APP_NAME: ${{ vars.PM2_APP_NAME || 'coachmax' }}
         run: |
           ssh -i ~/.ssh/id_ed25519 -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" \
-            "cd '$DEPLOY_PATH' && npm ci --omit=dev && pm2 reload '$PM2_APP_NAME' --update-env && pm2 save"
+            "export NVM_DIR=\"\$HOME/.nvm\" && . \"\$NVM_DIR/nvm.sh\" && nvm use 22 >/dev/null && cd '$DEPLOY_PATH' && npm ci --omit=dev && pm2 reload '$PM2_APP_NAME' --update-env && pm2 save"
       - name: Verify live API
         run: curl --fail --silent --show-error --retry 10 --retry-all-errors --retry-delay 3 https://coachmax.server24.in/health/live
