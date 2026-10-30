@@ -14,11 +14,11 @@ router.post("/resendOtp", resetRateLimit, resendOTP);
 router.post("/verifyOtp", resetRateLimit, verifyOtp);
 
 router.post("/resetPassword", resetRateLimit, resetPassword);
-router.post("/changePassword", auth, resetRateLimit, changePassword);
+router.post("/changePassword", auth, require("../middleware/auditMutations"), resetRateLimit, changePassword);
 
 router.get("/getMyProfile", auth, getMyProfile);
 
-router.put("/updateMyProfile", auth, uploads.any(), updateMyProfile);
+router.put("/updateMyProfile", auth, require("../middleware/auditMutations"), uploads.any(), updateMyProfile);
 
 router.put(
   "/updateChild/:childId",

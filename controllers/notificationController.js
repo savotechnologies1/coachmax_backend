@@ -115,8 +115,8 @@ exports.markAllParentNotificationsRead = async (req, res) => {
 exports.getAdminNotifications = async (req, res) => {
   try {
     const adminId = req.admin ? req.admin._id : null;
-    const role = req.role || req.admin?.role || "ADMIN";
-    const isSuperAdmin = role === "SUPER_ADMIN" || role === "ADMIN";
+    const role = req.admin?.role || req.role || "ADMIN";
+    const isSuperAdmin = role === "SUPER_ADMIN" || role === "ADMIN" || (role === "COACH" && req.admin?.accessMode === "FULL");
 
     let { page = 1, limit = 10, isRead } = req.query;
 
@@ -174,8 +174,8 @@ exports.markAdminNotificationRead = async (req, res) => {
   try {
     const { notificationId } = req.params;
     const adminId = req.admin ? req.admin._id : null;
-    const role = req.role || req.admin?.role || "ADMIN";
-    const isSuperAdmin = role === "SUPER_ADMIN" || role === "ADMIN";
+    const role = req.admin?.role || req.role || "ADMIN";
+    const isSuperAdmin = role === "SUPER_ADMIN" || role === "ADMIN" || (role === "COACH" && req.admin?.accessMode === "FULL");
 
     let query = { _id: notificationId };
     if (isSuperAdmin) {
@@ -215,8 +215,8 @@ exports.markAdminNotificationRead = async (req, res) => {
 exports.markAllAdminNotificationsRead = async (req, res) => {
   try {
     const adminId = req.admin ? req.admin._id : null;
-    const role = req.role || req.admin?.role || "ADMIN";
-    const isSuperAdmin = role === "SUPER_ADMIN" || role === "ADMIN";
+    const role = req.admin?.role || req.role || "ADMIN";
+    const isSuperAdmin = role === "SUPER_ADMIN" || role === "ADMIN" || (role === "COACH" && req.admin?.accessMode === "FULL");
 
     let query = { isRead: false };
     if (isSuperAdmin) {

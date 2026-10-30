@@ -1,5 +1,6 @@
 const Class = require("../models/Class");
 const Team = require("../models/Team");
+const { scopeFor } = require("../utils/coachPermissions");
 
 const isCoach = async (req, res, next) => {
   try {
@@ -10,7 +11,7 @@ const isCoach = async (req, res, next) => {
       });
     }
 
-    if (["SUPER_ADMIN", "ADMIN"].includes(req.admin.role)) {
+    if (["SUPER_ADMIN", "ADMIN"].includes(req.admin.role) || (req.admin.role === "COACH" && req.admin.accessMode === "FULL")) {
       return next();
     }
 
@@ -22,7 +23,7 @@ const isCoach = async (req, res, next) => {
     }
     const classId = req.params?.classId || req.body?.classId || req.query?.classId;
 
-    if (classId) {
+    if (classId && scopeFor(req.admin, "classes") === "ASSIGNED") {
       const classData = await Class.findById(classId).select("coach assistantCoach");
 
       if (!classData) {
@@ -46,7 +47,7 @@ const isCoach = async (req, res, next) => {
     }
     const teamId = req.params?.teamId || req.body?.teamId || req.query?.teamId;
 
-    if (teamId) {
+    if (teamId && scopeFor(req.admin, "teams") === "ASSIGNED") {
       const teamData = await Team.findById(teamId).select("coach assistantCoach");
 
       if (!teamData) {

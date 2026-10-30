@@ -17,6 +17,10 @@ const path = require("path");
 const { sendNotification } = require("../services/notificationService");
 const { getIO, isUserOnline, calculateTickStatus } = require("../sockets/chatSocket");
 const { dateOnly } = require("../utils/dateTime");
+const { scopeFor } = require("../utils/coachPermissions");
+const coachScoped = (req, module) => req.admin?.role === "COACH" &&
+  (scopeFor(req.admin, "communication") === "ASSIGNED" || scopeFor(req.admin, module) === "ASSIGNED");
+const fullStaffAccess = (req) => req.admin && (["ADMIN", "SUPER_ADMIN"].includes(req.admin.role) || req.admin.accessMode === "FULL");
 const {
   getActor,
   isRoomMember,
@@ -220,7 +224,10 @@ exports.startDirectChat = async (req, res) => {
       });
     }
 
-    if (req.admin && req.admin.role === "COACH" && otherModel === "Parent") {
+    if (req.admin && req.admin.role === "COACH" && otherModel === "Parent" && !require("../utils/coachPermissions").can(req.admin, "parents", "read")) {
+      return res.status(403).json({ success: false, message: "Parent access is disabled" });
+    }
+    if (req.admin && otherModel === "Parent" && coachScoped(req, "parents")) {
       const children = await User.find({ parentId: otherId }).select("_id");
       const childIds = children.map((c) => c._id);
       let canChatWithParent = false;
@@ -256,7 +263,11 @@ exports.startDirectChat = async (req, res) => {
           $or: [{ coach: currentUserId }, { assistantCoach: currentUserId }],
           players: { $in: childIds },
         }).select("_id");
-        canChatWithParent = assignedClasses.length > 0;
+        const assignedTeam = await Team.exists({
+          $or: [{ coach: currentUserId }, { assistantCoach: currentUserId }],
+          "players.player": { $in: childIds },
+        });
+        canChatWithParent = assignedClasses.length > 0 || Boolean(assignedTeam);
       }
 
       if (!canChatWithParent) {
@@ -355,7 +366,7 @@ exports.sendClassBroadcast = async (req, res) => {
       queryClasses = [paramClassId];
     } else {
       const filter = { status: "ACTIVE" };
-      if (req.admin.role === "COACH") {
+      if (coachScoped(req, "classes")) {
         filter.$and = filter.$and || [];
         filter.$and.push({
           $or: [
@@ -411,7 +422,7 @@ exports.sendClassBroadcast = async (req, res) => {
         populate: { path: "parentId", select: "_id fullName" },
       });
 
-    if (req.admin.role === "COACH") {
+    if (coachScoped(req, "classes")) {
       const unauthorizedClass = classesData.find((classData) => {
         const coachIdText = req.admin._id.toString();
         return classData.coach?.toString() !== coachIdText && classData.assistantCoach?.toString() !== coachIdText;
@@ -742,7 +753,7 @@ exports.sendTeamBroadcast = async (req, res) => {
       }
     }
 
-    if (req.admin.role === "COACH" && team.coach?.toString() !== req.admin._id.toString() && team.assistantCoach?.toString() !== req.admin._id.toString()) {
+    if (coachScoped(req, "teams") && team.coach?.toString() !== req.admin._id.toString() && team.assistantCoach?.toString() !== req.admin._id.toString()) {
       return res.status(403).json({ success: false, message: "Access denied. You are not assigned to this team." });
     }
 
@@ -861,7 +872,7 @@ exports.openLeagueChat = async (req, res) => {
       .populate({ path: "players.player", select: "_id parentId", populate: { path: "parentId", select: "_id" } })
       .populate({ path: "leagues.players.player", select: "_id parentId", populate: { path: "parentId", select: "_id" } });
 
-    if (String(req.admin.role || "").toUpperCase() === "COACH" &&
+    if (coachScoped(req, "leagues") &&
       !teams.some((team) => team.coach?.toString() === req.admin._id.toString() || team.assistantCoach?.toString() === req.admin._id.toString())) {
       return res.status(403).json({ success: false, message: "You are not assigned to a team in this league." });
     }
@@ -948,7 +959,7 @@ exports.openClassChat = async (req, res) => {
       .populate("category", "name");
     if (!classData) return res.status(404).json({ success: false, message: "Class not found" });
     if (classData.term?.status === "COMPLETED" || classData.status === "COMPLETED") return res.status(409).json({ success: false, message: "This class chat is completed and read-only." });
-    if (req.admin.role === "COACH" && classData.coach?.toString() !== req.admin._id.toString() && classData.assistantCoach?.toString() !== req.admin._id.toString()) {
+    if (coachScoped(req, "classes") && classData.coach?.toString() !== req.admin._id.toString() && classData.assistantCoach?.toString() !== req.admin._id.toString()) {
       return res.status(403).json({ success: false, message: "You are not assigned to this class." });
     }
     const parentIds = [...new Set((classData.players || []).map((player) => player.parentId?._id || player.parentId).filter(Boolean).map((id) => id.toString()))];
@@ -1000,7 +1011,7 @@ exports.openTeamChat = async (req, res) => {
       .populate("term", "name year status");
     if (!team) return res.status(404).json({ success: false, message: "Team not found" });
     if (team.term?.status === "COMPLETED") return res.status(409).json({ success: false, message: "This team's term has finished; its chat is read-only." });
-    if (req.admin.role === "COACH" && team.coach?.toString() !== req.admin._id.toString() && team.assistantCoach?.toString() !== req.admin._id.toString()) {
+    if (coachScoped(req, "teams") && team.coach?.toString() !== req.admin._id.toString() && team.assistantCoach?.toString() !== req.admin._id.toString()) {
       return res.status(403).json({ success: false, message: "You are not assigned to this team." });
     }
     const roster = team.players || [];
@@ -1108,7 +1119,7 @@ exports.sendMessage = async (req, res) => {
     }
 
     const actor = getActor(req);
-    if (!isRoomMember(room, actor) && (!req.admin || req.admin.role !== "SUPER_ADMIN")) {
+    if (!isRoomMember(room, actor) && !fullStaffAccess(req)) {
       return res.status(403).json({
         success: false,
         message: "Access denied. You are not a member of this chat room.",
@@ -1250,7 +1261,7 @@ exports.getMyRooms = async (req, res) => {
         : [legacyDirectRoom];
     }
 
-    if (req.admin && req.admin.role === "SUPER_ADMIN") {
+    if (fullStaffAccess(req)) {
       delete query["members.user"];
       delete query["members.refModel"];
     }
@@ -1298,7 +1309,7 @@ exports.getMyRooms = async (req, res) => {
       })
     );
 
-    if (!(req.admin && ["SUPER_ADMIN", "ADMIN"].includes(String(req.admin.role || "").toUpperCase()))) {
+    if (!fullStaffAccess(req)) {
       roomsWithLastMessage = roomsWithLastMessage.filter((room) =>
         room.status !== "ARCHIVED" && room.chatStatus !== "ARCHIVED" && room.entityStatus !== "COMPLETED"
       );
@@ -1339,7 +1350,7 @@ exports.getRoomMessages = async (req, res) => {
     page = Number(page);
     limit = Number(limit);
 
-    if (!req.admin || req.admin.role !== "SUPER_ADMIN") {
+    if (!fullStaffAccess(req)) {
       const room = await ChatRoom.findById(roomId);
       if (!room) {
         return res.status(404).json({ success: false, message: "Room not found" });
@@ -1497,6 +1508,14 @@ exports.getAllConversations = async (req, res) => {
 exports.getClassParents = async (req, res) => {
   try {
     const { classId } = req.params;
+    if (req.admin?.role === "COACH") {
+      const permissions = require("../utils/coachPermissions");
+      if (!permissions.can(req.admin, "parents", "read")) return res.status(403).json({ success: false, message: "Parent access is disabled" });
+      if (coachScoped(req, "parents")) {
+        const assigned = await Class.exists({ _id: classId, $or: [{ coach: req.admin._id }, { assistantCoach: req.admin._id }] });
+        if (!assigned) return res.status(403).json({ success: false, message: "Class is not assigned to you" });
+      }
+    }
 
     const classData = await Class.findById(classId)
       .populate({
@@ -1554,6 +1573,11 @@ exports.deleteSingleMessage = async (req, res) => {
       return res.status(404).json({ success: false, message: "Message not found" });
     }
 
+    if (coachScoped(req, "communication")) {
+      const room = await ChatRoom.findById(message.room);
+      if (!room || !isRoomMember(room, getActor(req))) return res.status(403).json({ success: false, message: "This conversation is not assigned to you" });
+    }
+
     const roomId = message.room;
 
     if (message.attachments && Array.isArray(message.attachments)) {
@@ -1578,9 +1602,9 @@ exports.deleteSingleMessage = async (req, res) => {
         action: "MESSAGE_DELETED",
         entityType: "Message",
         entityId: messageId,
-        ipAddress: req.ip || "",
+        ipAddress: require("../utils/sessionInfo").clientIp(req),
         deviceInfo: req.headers["user-agent"] || "",
-        description: `Admin deleted message ${messageId} from room ${roomId}`,
+        description: "Admin deleted a message from a conversation",
       });
     }
 
@@ -1659,6 +1683,9 @@ exports.deleteFullChatRoom = async (req, res) => {
     if (!room) {
       return res.status(404).json({ success: false, message: "Chat room not found" });
     }
+    if (coachScoped(req, "communication") && !isRoomMember(room, getActor(req))) {
+      return res.status(403).json({ success: false, message: "This conversation is not assigned to you" });
+    }
 
     const messages = await Message.find({ room: roomId });
 
@@ -1688,9 +1715,9 @@ exports.deleteFullChatRoom = async (req, res) => {
         action: "CHAT_ROOM_DELETED",
         entityType: "ChatRoom",
         entityId: roomId,
-        ipAddress: req.ip || "",
+        ipAddress: require("../utils/sessionInfo").clientIp(req),
         deviceInfo: req.headers["user-agent"] || "",
-        description: `Admin deleted chat room ${roomId} and ${deleteResult.deletedCount || 0} message(s)`,
+        description: `Admin deleted a conversation and ${deleteResult.deletedCount || 0} message(s)`,
       });
     }
     try {

@@ -5,12 +5,14 @@ const auditLogSchema = new mongoose.Schema(
     user: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "Admin",
-      required: true,
+      default: null,
     },
     userRole: {
       type: String,
       required: true,
     },
+    actorName: { type: String, default: "" },
+    actorEmail: { type: String, default: "" },
     action: {
       type: String,
       required: true,
@@ -23,6 +25,8 @@ const auditLogSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.ObjectId,
       required: true,
     },
+    entityName: { type: String, default: "" },
+    source: { type: String, default: "" },
     ipAddress: {
       type: String,
       default: "",
@@ -50,5 +54,9 @@ const auditLogSchema = new mongoose.Schema(
 auditLogSchema.index({ user: 1, createdAt: -1 });
 auditLogSchema.index({ entityType: 1, entityId: 1 });
 auditLogSchema.index({ action: 1 });
+auditLogSchema.post("save", function () {
+  const context = require("../utils/auditContext").getStore();
+  if (context) context.wrote = true;
+});
 
 module.exports = mongoose.model("AuditLog", auditLogSchema);

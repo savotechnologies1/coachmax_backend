@@ -216,6 +216,10 @@ exports.getAdminInvoices = async (req, res) => {
     } = req.query;
 
     const query = {};
+    if (req.staffScope?.scope === "ASSIGNED") {
+      const ids = await require("../middleware/isAdmin").assignedPlayerIds(req.admin._id);
+      Object.assign(query, require("../middleware/isAdmin").assignedInvoiceQuery(ids));
+    }
 
     if (status) query.status = status;
     if (paymentStatus) query.paymentStatus = paymentStatus;

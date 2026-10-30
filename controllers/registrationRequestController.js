@@ -260,6 +260,10 @@ exports.getPlayersByCategoryAndProgram = async (req, res) => {
     };
 
     const andConditions = [];
+    if (req.staffScope?.scope === "ASSIGNED") {
+      const assignedIds = await require("../middleware/isAdmin").assignedPlayerIds(req.admin._id);
+      andConditions.push({ _id: { $in: assignedIds } });
+    }
     let requestFilter = { status: "PENDING" };
 
     if (allocationStatus === "UNALLOCATED") {
@@ -491,7 +495,9 @@ exports.getPlayersByCategoryAndProgram = async (req, res) => {
 
 exports.assignClassesToPlayer = async (req, res) => {
   try {
-    const result = await enrollPlayer({ ...req.body, playerId: req.params?.playerId || req.body?.playerId }, req.admin);
+    const device = require("../utils/sessionInfo").deviceInfo(req);
+    const result = await enrollPlayer({ ...req.body, playerId: req.params?.playerId || req.body?.playerId,
+      auditContext: { ipAddress: require("../utils/sessionInfo").clientIp(req), deviceInfo: device.userAgent, source: device.source } }, req.admin);
     if (broadcastSidebarBadges) broadcastSidebarBadges().catch(() => {});
     return res.json({ success: true, message: result.repeated ? "This allocation was already completed" : "Player approved and allocated successfully", data: { player: result.player, registrationRequest: result.registrationRequest }, repeated: result.repeated });
   } catch (error) {
@@ -502,7 +508,7 @@ exports.assignClassesToPlayer = async (req, res) => {
 exports.rejectAndDeleteRegistrationRequest = async (req, res) => {
   const session = await mongoose.startSession();
   try {
-    if (!["SUPER_ADMIN", "ADMIN"].includes(req.admin?.role)) return res.status(403).json({ success: false, message: "Administrator access required" });
+    if (!require("../utils/coachPermissions").can(req.admin, "requests", "approve")) return res.status(403).json({ success: false, message: "Request approval access required" });
     const reason = String(req.body?.reason || "").trim();
     if (!reason || reason.length > 2000) return res.status(400).json({ success: false, message: "Provide a rejection reason of 1 to 2000 characters" });
     let deletedRequest;
@@ -532,11 +538,17 @@ exports.rejectAndDeleteRegistrationRequest = async (req, res) => {
       await AuditLog.create([{
         user: req.admin._id,
         userRole: req.admin.role,
+        actorName: req.admin.name || "",
+        actorEmail: req.admin.email || "",
         action: "REGISTRATION_REJECTED_AND_DELETED",
         entityType: "RegistrationRequest",
         entityId: request._id,
+        entityName: player?.fullName ? `Request for ${player.fullName}` : "Registration request",
+        ipAddress: require("../utils/sessionInfo").clientIp(req),
+        deviceInfo: require("../utils/sessionInfo").deviceInfo(req).userAgent,
+        source: require("../utils/sessionInfo").deviceInfo(req).source,
         newValue: { status: "REJECTED_AND_DELETED", player: request.player, requestType: request.requestType, reason },
-        description: "Pending registration request rejected and permanently deleted; player profile and history retained",
+        description: `Registration request for ${player?.fullName || "a player"} rejected and deleted; player profile and history retained`,
       }], { session });
     });
     if (broadcastSidebarBadges) broadcastSidebarBadges().catch(() => {});

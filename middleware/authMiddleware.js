@@ -26,6 +26,11 @@ const auth = async (req, res, next) => {
       req.role = "ADMIN";
       req.token = token;
       req.authenticated = true;
+      // Session metadata is best effort; the token list remains the source of truth.
+      Admin.updateOne(
+        { _id: admin._id, sessions: { $elemMatch: { tokenHash: require("../utils/sessionInfo").tokenHash(token), lastSeenAt: { $lt: new Date(Date.now() - 60_000) } } } },
+        { $set: { "sessions.$.lastSeenAt": new Date() } }
+      ).catch(() => {});
       return next();
     }
     const parent = await Parent.findOne({

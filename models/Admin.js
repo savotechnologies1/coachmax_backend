@@ -1,5 +1,16 @@
 const mongoose = require("mongoose");
 
+const adminSessionSchema = new mongoose.Schema({
+    tokenHash: { type: String, required: true },
+    source: { type: String, enum: ["Web", "App", "Unknown"], default: "Unknown" },
+    device: { type: String, default: "Unknown device" },
+    ipAddress: { type: String, default: "" },
+    userAgent: { type: String, default: "" },
+    fcmToken: { type: String, default: "" },
+    signedInAt: { type: Date, default: Date.now },
+    lastSeenAt: { type: Date, default: Date.now },
+});
+
 const adminSchema = new mongoose.Schema(
     {
         name: String,
@@ -36,6 +47,9 @@ const adminSchema = new mongoose.Schema(
                 type: String,
             }
         ],
+        // Keep the small active-device list with the staff account. Atlas Free
+        // cannot create another collection when its 500-collection cap is reached.
+        sessions: { type: [adminSessionSchema], select: false, default: [] },
         role: {
             type: String,
             enum: ["SUPER_ADMIN", "COACH"],
@@ -44,6 +58,15 @@ const adminSchema = new mongoose.Schema(
         isActive: {
             type: Boolean,
             default: true,
+        },
+        accessMode: {
+            type: String,
+            enum: ["FULL", "PARTIAL"],
+            default: "PARTIAL",
+        },
+        permissions: {
+            type: mongoose.Schema.Types.Mixed,
+            default: () => ({}),
         },
     },
     { timestamps: true }

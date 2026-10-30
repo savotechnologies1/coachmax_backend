@@ -187,7 +187,7 @@ exports.getMyRooms = async (req, res) => {
     const pageSize = Math.min(100, Math.max(1, Number(limit) || 50));
     const selectedType = type;
     const isAdminHistoryViewer = Boolean(
-      req.admin && ["SUPER_ADMIN", "ADMIN"].includes(String(req.admin.role || "").toUpperCase())
+      req.admin && (["SUPER_ADMIN", "ADMIN"].includes(String(req.admin.role || "").toUpperCase()) || req.admin.accessMode === "FULL")
     );
     const query = isAdminHistoryViewer
       ? {}

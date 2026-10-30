@@ -15,7 +15,7 @@ const configuredOrigins = () => new Set(["https://admin.coachmax.server24.in", .
 app.use(cors({ origin(origin, callback) {
   if (!origin || configuredOrigins().has(origin) || (process.env.NODE_ENV !== "production" && /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin))) return callback(null, true);
   return callback(Object.assign(new Error("Origin is not allowed"), { status: 403 }));
-}, methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"], allowedHeaders: ["Content-Type", "Authorization", "Idempotency-Key", "ngrok-skip-browser-warning"] }));
+}, methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"], allowedHeaders: ["Content-Type", "Authorization", "Idempotency-Key", "X-Client-Platform", "ngrok-skip-browser-warning"] }));
 app.use(express.json({ limit: "1mb" }));
 app.use(signPrivateJson);
 app.get("/health/live", (req, res) => res.json({ status: "ok" }));

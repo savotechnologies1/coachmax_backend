@@ -98,7 +98,7 @@ exports.createTemporaryPlayer = async (req, res) => {
       return res.status(404).json({ success: false, message: "Class not found" });
     }
 
-    if (req.admin.role === "COACH") {
+    if (req.admin.role === "COACH" && require("../utils/coachPermissions").scopeFor(req.admin, "players") === "ASSIGNED") {
       const isAssigned =
         (classData.coach && classData.coach.toString() === coachId.toString()) ||
         (classData.assistantCoach && classData.assistantCoach.toString() === coachId.toString());
@@ -137,7 +137,7 @@ exports.createTemporaryPlayer = async (req, res) => {
     const contactDetailsMismatch = parents.length > 1 ||
       (emailParent && String(emailParent.phone).replace(/\D/g, "") !== phoneDigits) ||
       (phoneParent && String(phoneParent.email).trim().toLowerCase() !== emailToUse);
-    const isAdminOperator = ["ADMIN", "SUPER_ADMIN"].includes(req.admin.role);
+    const isAdminOperator = ["ADMIN", "SUPER_ADMIN"].includes(req.admin.role) || (req.admin.role === "COACH" && req.admin.accessMode === "FULL");
     if (contactDetailsMismatch && !isAdminOperator) {
       throw Object.assign(new Error("Parent email and phone identify different household details. Ask an administrator to verify and update the parent account first."), { statusCode: 409 });
     }
@@ -243,10 +243,14 @@ exports.createTemporaryPlayer = async (req, res) => {
         {
           user: coachId,
           userRole: req.admin.role,
+          actorName: req.admin.name || "",
+          actorEmail: req.admin.email || "",
           action: "TEMP_PLAYER_CREATED",
           entityType: "User",
           entityId: player._id,
-          ipAddress: req.ip || "",
+          entityName: player.fullName || "Temporary player",
+          source: require("../utils/sessionInfo").deviceInfo(req).source,
+          ipAddress: require("../utils/sessionInfo").clientIp(req),
           deviceInfo: req.headers["user-agent"] || "",
           newValue: {
             playerId: player._id,
@@ -364,7 +368,7 @@ exports.getTemporaryPlayers = async (req, res) => {
       ],
     };
 
-    if (req.admin.role === "COACH") {
+    if (req.admin.role === "COACH" && require("../utils/coachPermissions").scopeFor(req.admin, "requests") === "ASSIGNED") {
       unapprovedUserQuery.createdBy = coachId;
     }
     if (classId) {

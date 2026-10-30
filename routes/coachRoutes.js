@@ -64,8 +64,12 @@ const {
 const { getMyRooms } = require("../controllers/chatController");
 
 const router = express.Router();
+const { getMyAccess } = require("../controllers/coachAccessController");
 const { requireStaff, requirePlayerAccess } = require("../middleware/staffAccess");
 router.use(auth, requireStaff);
+router.use(require("../middleware/auditMutations"));
+router.get("/access", getMyAccess);
+router.use(require("../middleware/coachRoutePermission"));
 
 // ─── Dashboard ──────────────────────────────
 router.get("/dashboard", auth, isCoach, getCoachDashboard);

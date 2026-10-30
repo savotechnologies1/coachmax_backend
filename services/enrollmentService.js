@@ -123,7 +123,11 @@ function createEnrollmentService(deps = {}) {
             if (generated.error) throw fail(409, generated.error);
           }
         }
-        await models.AuditLog.create([{ user: actor._id, userRole: actor.role, action: "PLAYER_ALLOCATED", entityType: "User", entityId: player._id, oldValue: null, newValue: { requestId: request?._id, classIds, termId, paymentStatus, overrideReason: hasOverride ? overrideReason : "" }, description: "Player approved and allocated through canonical enrollment" }], { session });
+        await models.AuditLog.create([{ user: actor._id, userRole: actor.role, actorName: actor.name || "", actorEmail: actor.email || "",
+          action: "PLAYER_ALLOCATED", entityType: "User", entityId: player._id, entityName: player.fullName || "Player", oldValue: null,
+          newValue: { requestId: request?._id, classIds, classNames: classes.map((cls) => cls.name), termId, termName: term.name, paymentStatus, overrideReason: hasOverride ? overrideReason : "" },
+          description: `${player.fullName || "Player"} approved and allocated to ${classes.map((cls) => cls.name).join(", ")}`,
+          ipAddress: command.auditContext?.ipAddress || "", deviceInfo: command.auditContext?.deviceInfo || "", source: command.auditContext?.source || "" }], { session });
         await queueNotification(`enrollment:${request?._id || `${player._id}:${classIds.map(id).sort().join(":")}`}`, {
           recipientType: "PARENT", parentId: player.parentId,
           title: "Player Enrollment Completed", message: `${player.fullName} has been enrolled in ${classes.map((cls) => cls.name).join(", ")}. Payment status: ${paymentStatus}.`,

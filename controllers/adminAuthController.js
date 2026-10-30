@@ -33,6 +33,7 @@ const PlayerStatistics = require("../models/PlayerStatistics");
 const TrainingSession = require("../models/TrainingSession");
 const Message = require("../models/Message");
 const AuditLog = require("../models/AuditLog");
+const { tokenHash, isActiveToken, clientIp, deviceInfo } = require("../utils/sessionInfo");
 const { generateClassInvoice, generateTransferInvoice, generateTeamInvoice, generateLeagueInvoice } = require("../services/invoiceService");
 const {
   normalizePaymentStatus,
@@ -41,6 +42,17 @@ const {
 } = require("../utils/paymentStatus");
 const { dateOnly, dateOnlyToUtc, serializeTerm, ageGroupContextYear, ageGroupDobRange, parseAgeGroupRange, formatDateOnly, formatTimestamp, dateOnlyStartUtc, dateOnlyEndUtc, todayDateOnly, calendarTimestampRange } = require("../utils/dateTime");
 const { validatedTermData } = require("../utils/termDates");
+
+const recordSignInFailure = async (req, account, reason) => {
+  const device = deviceInfo(req);
+  const attempted = String(req.body?.email || req.body?.mobile || "").trim().slice(0, 254);
+  try {
+    await AuditLog.create({ user: null, userRole: "UNVERIFIED", actorName: "Unverified sign-in", action: reason === "inactive" ? "LOGIN_BLOCKED" : "LOGIN_FAILED",
+      entityType: "Authentication", entityId: account?._id || new mongoose.Types.ObjectId(), entityName: account?.name || attempted || "Unknown account",
+      description: `${reason === "inactive" ? "Blocked" : "Failed"} sign-in attempt for ${account?.name || attempted || "an unknown account"} from ${device.device} (${device.source})`,
+      ipAddress: clientIp(req), deviceInfo: device.userAgent, source: device.source });
+  } catch (error) { console.error("Failed sign-in could not be audited", { message: error.message }); }
+};
 
 exports.adminLogin = async (req, res) => {
   try {
@@ -55,37 +67,54 @@ exports.adminLogin = async (req, res) => {
     }).select("+password");
 
     if (!admin) {
+      await recordSignInFailure(req, null, "unknown");
       return res.status(404).json({ message: "Admin not found" });
     }
 
     if (admin.role === "COACH" && admin.isActive === false) {
+      await recordSignInFailure(req, admin, "inactive");
       return res.status(403).json({ message: "Coach is inactive and cannot log in" });
     }
 
     const isMatch = await bcrypt.compare(password, admin.password);
 
     if (!isMatch) {
+      await recordSignInFailure(req, admin, "wrong-password");
       return res.status(401).json({ message: "Invalid credentials" });
     }
 
     const token = generateToken(admin._id);
 
-    admin.tokens = admin.tokens || [];
-    admin.tokens.push(token);
-    admin.tokens = admin.tokens.slice(-5);
-
-    if (fcmToken) {
-      admin.fcmTokens = admin.fcmTokens || [];
-      if (!admin.fcmTokens.includes(fcmToken)) {
-        admin.fcmTokens.push(fcmToken);
-      }
+    const expired = (admin.tokens || []).filter((value) => !isActiveToken(value));
+    if (expired.length) await Admin.updateOne({ _id: admin._id }, { $pull: {
+      tokens: { $in: expired }, sessions: { tokenHash: { $in: expired.map(tokenHash) } },
+    } });
+    const device = deviceInfo(req);
+    const hash = tokenHash(token);
+    const now = new Date();
+    const loginUpdate = { $push: {
+      tokens: { $each: [token], $slice: -5 },
+      sessions: { $each: [{ tokenHash: hash, source: device.source, device: device.device, ipAddress: clientIp(req), userAgent: device.userAgent, fcmToken: fcmToken || "", signedInAt: now, lastSeenAt: now }], $slice: -5 },
+    } };
+    if (fcmToken) loginUpdate.$addToSet = { fcmTokens: fcmToken };
+    const signedIn = await Admin.updateOne({ _id: admin._id, isActive: { $ne: false } }, loginUpdate);
+    if (!signedIn.matchedCount) return res.status(403).json({ message: "Account is inactive" });
+    try {
+      await AuditLog.create({ user: admin._id, userRole: admin.role, actorName: admin.name || "", actorEmail: admin.email || "", action: "LOGIN", entityType: "Admin", entityId: admin._id,
+        description: `${admin.name || admin.email} signed in from ${device.device} (${device.source})`, ipAddress: clientIp(req), deviceInfo: device.userAgent, source: device.source });
+    } catch (error) {
+      console.error("Sign-in audit could not be written", { message: error.message });
     }
-
-    await admin.save();
 
     const adminObj = admin.toObject();
     delete adminObj.password;
     delete adminObj.tokens;
+    delete adminObj.fcmTokens;
+    delete adminObj.sessions;
+    delete adminObj.otp;
+    delete adminObj.otpExpire;
+    delete adminObj.resetTokenHash;
+    delete adminObj.resetTokenExpire;
 
     res.json({
       success: true,
@@ -94,23 +123,32 @@ exports.adminLogin = async (req, res) => {
     });
 
   } catch (err) {
-    res.status(500).json({ message: err.message });
+    console.error("Admin sign-in failed", { message: err.message });
+    res.status(500).json({ message: "Sign-in is temporarily unavailable. Please try again." });
   }
 };
 
 exports.logout = async (req, res) => {
   try {
     const { fcmToken } = req.body || {};
+    const account = await Admin.findById(req.admin._id).select("+sessions");
+    const session = account?.sessions?.find((item) => item.tokenHash === tokenHash(req.token));
+    let removableFcm = fcmToken || session?.fcmToken || "";
+    if (removableFcm && account?.sessions?.some((item) => item.tokenHash !== tokenHash(req.token) && item.fcmToken === removableFcm)) removableFcm = "";
 
     const updateQuery = {
-      $set: { tokens: [] }
+      $pull: { tokens: req.token, sessions: { tokenHash: tokenHash(req.token) } }
     };
 
-    if (fcmToken) {
-      updateQuery.$pull = { fcmTokens: fcmToken };
+    if (removableFcm) {
+      updateQuery.$pull.fcmTokens = removableFcm;
     }
 
     await Admin.findByIdAndUpdate(req.admin._id, updateQuery);
+    try {
+      await AuditLog.create({ user: req.admin._id, userRole: req.admin.role, actorName: req.admin.name || "", actorEmail: req.admin.email || "", action: "LOGOUT", entityType: "Admin", entityId: req.admin._id,
+        description: `${req.admin.name || req.admin.email} signed out of this device`, ipAddress: clientIp(req), deviceInfo: deviceInfo(req).userAgent, source: deviceInfo(req).source });
+    } catch (error) { console.error("Sign-out audit could not be written", { message: error.message }); }
     res.json({ message: "Logged out successfully" });
 
   } catch (err) {
@@ -196,6 +234,10 @@ exports.getUsers = async (req, res) => {
     limit = Math.max(1, Math.min(100, parseInt(limit, 10) || 10));
 
     const andConditions = [{ parentId: { $exists: true } }];
+    if (req.staffScope?.scope === "ASSIGNED") {
+      const ids = await require("../middleware/isAdmin").assignedPlayerIds(req.admin._id);
+      andConditions.push({ _id: { $in: ids } });
+    }
 
     // Approval status is separate from payment status. The player list only
     // exposes real player records in the Approved and Rejected views.
@@ -455,14 +497,15 @@ exports.getUsers = async (req, res) => {
     if (search && search.trim()) {
       const searchTrim = search.trim();
       const searchRegex = { $regex: searchTrim, $options: "i" };
-      const matchingParents = await Parent.find({
-        $or: [
-          { fullName: searchRegex },
-          { email: searchRegex },
-          { phone: searchRegex },
-          { emergencyContact: searchRegex },
-        ],
-      }).distinct("_id");
+      const matchingParents = require("../utils/coachPermissions").can(req.admin, "parents", "read")
+        ? await Parent.find({
+          $or: [
+            { fullName: searchRegex },
+            { email: searchRegex },
+            { phone: searchRegex },
+            { emergencyContact: searchRegex },
+          ],
+        }).distinct("_id") : [];
 
       const searchCriteria = [
         { fullName: searchRegex },
@@ -527,7 +570,9 @@ exports.getUsers = async (req, res) => {
     ]);
 
     await User.populate(users, [
-      { path: "parentId", select: "fullName email phone address city state postcode country emergencyContact relationship" },
+      ...(require("../utils/coachPermissions").can(req.admin, "parents", "read")
+        ? [{ path: "parentId", select: "fullName email phone address city state postcode country emergencyContact relationship" }]
+        : []),
       { path: "category", select: "name" },
       { path: "categories", select: "name" },
       { path: "programs", select: "name" },
@@ -549,6 +594,7 @@ exports.getUsers = async (req, res) => {
     ]);
 
     users.forEach((user) => {
+      if (!require("../utils/coachPermissions").can(req.admin, "parents", "read")) user.parentId = null;
       if (user.paymentStatus) {
         user.paymentStatus = normalizePaymentStatus(user.paymentStatus);
       }
@@ -561,6 +607,10 @@ exports.getUsers = async (req, res) => {
 
     // Compute dynamic player stats scoped to term (or all database players if term is not specified)
     const termAndConditions = [{ parentId: { $exists: true } }];
+    if (req.staffScope?.scope === "ASSIGNED") {
+      const ids = await require("../middleware/isAdmin").assignedPlayerIds(req.admin._id);
+      termAndConditions.push({ _id: { $in: ids } });
+    }
     if (termClassIds.length > 0) {
       termAndConditions.push({
         $or: [
@@ -645,6 +695,10 @@ exports.getPlayerStats = async (req, res) => {
     const termScope = await resolvePlayerTermScope(term, year);
     const termClassIds = termScope?.classIds || [];
     const termAndConditions = [{ parentId: { $exists: true } }];
+    if (req.staffScope?.scope === "ASSIGNED") {
+      const ids = await require("../middleware/isAdmin").assignedPlayerIds(req.admin._id);
+      termAndConditions.push({ _id: { $in: ids } });
+    }
 
     if (termScope) {
       termAndConditions.push({
@@ -711,7 +765,7 @@ exports.getPlayerStats = async (req, res) => {
       User.countDocuments({ $and: officialPlayerConditions }),
       User.countDocuments({ $and: [...officialPlayerConditions, { playerStatus: { $in: ["ACTIVE", "APPROVED"] } }] }),
       User.countDocuments({ $and: [...termAndConditions, { $or: [{ playerStatus: "PENDING_APPROVAL" }, { hasPendingRequest: true }] }] }),
-      RegistrationRequest.countDocuments({ status: "PENDING", ...reqTermQuery }),
+      req.staffScope?.scope === "ASSIGNED" ? 0 : RegistrationRequest.countDocuments({ status: "PENDING", ...reqTermQuery }),
       User.countDocuments({ $and: [...officialPlayerConditions, { playerStatus: "REJECTED" }] }),
       User.countDocuments({
         $and: [
@@ -2459,12 +2513,16 @@ exports.deleteClassPermanently = async (req, res) => {
       await AuditLog.create({
         user: adminId,
         userRole: req.admin?.role || "SUPER_ADMIN",
+        actorName: req.admin?.name || "",
+        actorEmail: req.admin?.email || "",
         action: "CLASS_DELETED_PERMANENTLY",
         entityType: "Class",
         entityId: id,
-        ipAddress: req.ip || "",
+        entityName: cls.name || "Class",
+        source: deviceInfo(req).source,
+        ipAddress: clientIp(req),
         deviceInfo: req.headers["user-agent"] || "",
-        description: `Permanently deleted class '${cls.name}' (${id}) while preserving invoice records.`,
+        description: `Permanently deleted class '${cls.name}' while preserving invoice records.`,
       });
     }
 
@@ -2505,6 +2563,9 @@ exports.getAllClasses = async (req, res) => {
     limit = Number(limit) || 20;
 
     let filter = {};
+    if (req.staffScope?.scope === "ASSIGNED") {
+      filter.$and = [require("../middleware/isAdmin").assignedTeamQuery(req.admin._id)];
+    }
 
     const selectedTerm = termId;
     const selectedDay = day;
@@ -2551,6 +2612,9 @@ exports.getAllClassesForAssign = async (req, res, next) => {
   try {
     const { categoryId, programId, termId, term, status = 'ACTIVE' } = req.query;
     const filter = {};
+    if (req.staffScope?.scope === "ASSIGNED") {
+      filter.$and = [require("../middleware/isAdmin").assignedTeamQuery(req.admin._id)];
+    }
     for (const [key,value] of [['category',categoryId],['program',programId],['term',termId || term]]) if(value){if(!mongoose.isValidObjectId(value))return res.status(400).json({success:false,message:'Invalid '+key});filter[key]=value;}
     if(status && status !== 'ALL') {if(!['ACTIVE','INACTIVE'].includes(status))return res.status(400).json({message:'Invalid class status'});filter.status=status;}
     const classes=await Class.find(filter).populate('term','name year startDate endDate status').populate('program','name ageGroup status').populate('category','name').sort({dayOfWeek:1,startTime:1,name:1}).lean();
@@ -2565,6 +2629,10 @@ exports.getClassById = async (req, res) => {
 
     if (!classData) {
       return res.status(404).json({ message: "Class not found" });
+    }
+
+    if (!require("../utils/coachPermissions").can(req.admin, "parents", "read")) {
+      for (const player of classData.players || []) player.parentId = null;
     }
 
     res.json({ data: classData });
@@ -2976,7 +3044,10 @@ exports.getClassesByTerm = async (req, res) => {
       return res.status(404).json({ message: "Term not found" });
     }
 
-    const classes = await Class.find({ term: termId })
+    const classes = await Class.find({
+      term: termId,
+      ...(req.staffScope?.scope === "ASSIGNED" ? require("../middleware/isAdmin").assignedTeamQuery(req.admin._id) : {}),
+    })
       .populate("program", "name")
       .populate("category", "name")
       .populate("coach", "fullName")
@@ -3365,6 +3436,13 @@ exports.createCoach = async (req, res) => {
 
 exports.getAllCoaches = async (req, res) => {
   try {
+    if (req.staffCoachOptionsOnly) {
+      const coaches = await Admin.find({ role: "COACH", isActive: { $ne: false } })
+        .select("_id name fullName")
+        .sort({ name: 1, _id: 1 })
+        .lean();
+      return res.json({ data: coaches });
+    }
     const hasPagination = req.query.page !== undefined || req.query.limit !== undefined;
     if (hasPagination) {
       const page = Math.max(1, parseInt(req.query.page, 10) || 1);
@@ -3374,7 +3452,7 @@ exports.getAllCoaches = async (req, res) => {
 
       const [coaches, total] = await Promise.all([
         Admin.find(filter)
-          .select("-password")
+          .select("-password -tokens -fcmTokens -otp -otpExpire -resetTokenHash -resetTokenExpire -permissions")
           .sort({ createdAt: -1, _id: -1 })
           .skip(skip)
           .limit(limit),
@@ -3394,7 +3472,7 @@ exports.getAllCoaches = async (req, res) => {
     }
 
     const coaches = await Admin.find({ role: "COACH" })
-      .select("-password")
+      .select("-password -tokens -fcmTokens -otp -otpExpire -resetTokenHash -resetTokenExpire -permissions")
       .sort({ createdAt: -1, _id: -1 });
 
     res.json({ data: coaches });
@@ -3409,7 +3487,7 @@ exports.getCoachById = async (req, res) => {
     const coach = await Admin.findOne({
       _id: req.params.id,
       role: "COACH",
-    }).select("-password");
+    }).select("-password -tokens -fcmTokens -otp -otpExpire -resetTokenHash -resetTokenExpire -permissions");
 
     if (!coach) {
       return res.status(404).json({
@@ -3619,7 +3697,11 @@ exports.updateCoach = async (req, res) => {
       }
     }
 
-    const updateData = { ...body };
+    // Coach access is managed only by the dedicated, validated access endpoint.
+    const updateData = {};
+    if (body.name || body.fullName) updateData.name = body.name || body.fullName;
+    if (newEmail) updateData.email = String(newEmail).toLowerCase();
+    if (newMobile) updateData.mobile = newMobile;
     if (req.file) {
       updateData.profileImage = `uploads/profiles/${req.file.filename}`;
     }
@@ -3628,7 +3710,7 @@ exports.updateCoach = async (req, res) => {
       { _id: coachId, role: "COACH" },
       updateData,
       { new: true, runValidators: true }
-    ).select("-password");
+    ).select("-password -tokens -fcmTokens -otp -otpExpire -resetTokenHash -resetTokenExpire -permissions");
 
     if (!coach) {
       return res.status(404).json({
@@ -3667,8 +3749,18 @@ exports.toggleCoachActiveStatus = async (req, res) => {
     }
 
     coach.isActive = !coach.isActive;
+    if (!coach.isActive) {
+      coach.tokens = [];
+      coach.fcmTokens = [];
+    }
 
     await coach.save();
+    if (!coach.isActive) await Admin.updateOne({ _id: coach._id }, { $set: { sessions: [] } });
+    const device = deviceInfo(req);
+    await AuditLog.create({ user: req.admin._id, userRole: req.admin.role, actorName: req.admin.name || "", actorEmail: req.admin.email || "",
+      action: coach.isActive ? "COACH_ENABLED" : "COACH_DISABLED", entityType: "Admin", entityId: coach._id,
+      entityName: coach.name || coach.email, description: `${req.admin.name || req.admin.email} ${coach.isActive ? "enabled" : "disabled"} coach ${coach.name || coach.email}${coach.isActive ? "" : " and signed out all devices"}`,
+      ipAddress: clientIp(req), deviceInfo: device.userAgent, source: device.source });
 
     return res.json({
       success: true,
@@ -3710,7 +3802,15 @@ exports.changeCoachPassword = async (req, res) => {
 
     const hashedPassword = await bcrypt.hash(password, 10);
     coach.password = hashedPassword;
+    coach.tokens = [];
+    coach.fcmTokens = [];
     await coach.save();
+    await Admin.updateOne({ _id: coach._id }, { $set: { sessions: [] } });
+    const device = deviceInfo(req);
+    await AuditLog.create({ user: req.admin._id, userRole: req.admin.role, actorName: req.admin.name || "", actorEmail: req.admin.email || "",
+      action: "COACH_PASSWORD_CHANGED", entityType: "Admin", entityId: coach._id, entityName: coach.name || coach.email,
+      description: `${req.admin.name || req.admin.email} changed the password for coach ${coach.name || coach.email} and signed out all devices`,
+      ipAddress: clientIp(req), deviceInfo: device.userAgent, source: device.source });
 
     res.json({
       success: true,
@@ -3747,6 +3847,7 @@ exports.getClassPlayers = async (req, res) => {
 
     const formattedPlayers = classData.players.map((p) => {
       const pObj = p.toObject ? p.toObject() : { ...p };
+      if (!require("../utils/coachPermissions").can(req.admin, "parents", "read")) pObj.parentId = null;
       const cps = (p.classPaymentStatuses || []).find(
         (item) => item.class && item.class.toString() === classId.toString()
       );
@@ -3844,6 +3945,9 @@ exports.getClassFiltersWithTimeSlots = async (req, res) => {
     if (!allDays && !selectedDay) return res.status(400).json({ message: "Choose a weekday or View All" });
 
     const query = {};
+    if (req.staffScope?.scope === "ASSIGNED") {
+      query.$and = [require("../middleware/isAdmin").assignedTeamQuery(req.admin._id)];
+    }
     for (const [key, value] of [["category", categoryId], ["program", programId], ["term", selectedTerm]]) {
       if (!value) continue;
       if (!mongoose.Types.ObjectId.isValid(value)) return res.status(400).json({ message: `Invalid ${key} ID` });
@@ -3981,7 +4085,7 @@ exports.getClassFullTable = async (req, res) => {
           )?.paymentStatus,
           "TRIAL"
         ),
-        parent: player.parentId
+        parent: require("../utils/coachPermissions").can(req.admin, "parents", "read") && player.parentId
           ? {
             id: player.parentId._id,
             name: player.parentId.fullName,
@@ -4329,7 +4433,7 @@ exports.getTeamFullTable = async (req, res) => {
         prefferedFoot: player.prefferedFoot,
         paymentStatus: normalizePaymentStatus(item.paymentStatus, "TRIAL"),
         statistics: playerStats,
-        parent: player.parentId
+        parent: require("../utils/coachPermissions").can(req.admin, "parents", "read") && player.parentId
           ? {
             id: player.parentId._id,
             name: player.parentId.fullName || `${player.parentId.firstName || ""} ${player.parentId.lastName || ""}`.trim() || "N/A",
@@ -4552,6 +4656,20 @@ exports.getMyRole = async (req, res) => {
 exports.getPlayerDetails = async (req, res) => {
   try {
     const { playerId } = req.params;
+    const assignedOnly = req.staffScope?.scope === "ASSIGNED";
+    const allowedPlayerIds = assignedOnly ? await require("../middleware/isAdmin").assignedPlayerIds(req.admin._id) : null;
+    const canReadParents = require("../utils/coachPermissions").can(req.admin, "parents", "read");
+    const canReadFinance = require("../utils/coachPermissions").can(req.admin, "invoices", "read") || require("../utils/coachPermissions").can(req.admin, "payments", "read");
+    const canReadPayments = require("../utils/coachPermissions").can(req.admin, "payments", "read");
+    const canReadOrders = require("../utils/coachPermissions").can(req.admin, "orders", "read");
+    const canReadEvents = require("../utils/coachPermissions").can(req.admin, "events", "read");
+    const canReadLeagues = require("../utils/coachPermissions").can(req.admin, "leagues", "read");
+    const canReadTeams = require("../utils/coachPermissions").can(req.admin, "teams", "read");
+    const canReadAttendance = require("../utils/coachPermissions").can(req.admin, "attendance", "read");
+    const [assignedClassIds, assignedTeamIds] = assignedOnly ? await Promise.all([
+      Class.find(require("../middleware/isAdmin").assignedTeamQuery(req.admin._id)).distinct("_id"),
+      Team.find(require("../middleware/isAdmin").assignedTeamQuery(req.admin._id)).distinct("_id"),
+    ]) : [null, null];
 
     if (!mongoose.Types.ObjectId.isValid(playerId)) {
       return res.status(400).json({
@@ -4594,19 +4712,25 @@ exports.getPlayerDetails = async (req, res) => {
         message: "Player not found",
       });
     }
+    if (assignedOnly) {
+      const classIds = new Set(assignedClassIds.map(String));
+      player.assignedClasses = (player.assignedClasses || []).filter((cls) => classIds.has(String(cls?._id || cls)));
+      player.classPaymentStatuses = (player.classPaymentStatuses || []).filter((entry) => classIds.has(String(entry.class?._id || entry.class)));
+    }
 
-    const parentId = player.parentId?._id;
-    const otherPlayers = parentId
+    const parentId = player.parentId?._id || player.parentId;
+    const otherPlayers = canReadParents && parentId
       ? await User.find({
         parentId: parentId,
-        _id: { $ne: player._id },
+        _id: assignedOnly ? { $ne: player._id, $in: allowedPlayerIds } : { $ne: player._id },
       })
         .select("_id fullName firstName lastName profileImage playerStatus")
         .lean()
       : [];
 
-    const attendanceRecords = await Attendance.find({
+    const attendanceRecords = canReadAttendance ? await Attendance.find({
       "records.player": playerId,
+      ...(assignedOnly ? { $or: [{ class: { $in: assignedClassIds } }, { team: { $in: assignedTeamIds } }] } : {}),
     })
       .populate({ path: "class", select: "name dayOfWeek startTime endTime term" , populate: { path: "term", select: "name year startDate endDate isEvent" } })
       .populate({ path: "team", select: "teamName term" , populate: { path: "term", select: "name year startDate endDate isEvent" } })
@@ -4615,7 +4739,7 @@ exports.getPlayerDetails = async (req, res) => {
       .populate("campSession", "sessionDate sessionLabel sessionType")
       .populate("records.noteAuthor", "name")
       .sort({ sessionDate: -1 })
-      .lean();
+      .lean() : [];
 
     const perDayAttendance = attendanceRecords.map((att) => {
       const playerRecord = att.records.find(
@@ -4683,41 +4807,47 @@ exports.getPlayerDetails = async (req, res) => {
 
     // Include invoices and actual receipts so partial payments and discounts are
     // reported from finance records rather than inferred from a status flag.
-    const playerInvoices = await Invoice.find({
-      $or: [
+    const playerInvoices = canReadFinance ? await Invoice.find(assignedOnly
+      ? { players: playerId, ...require("../middleware/isAdmin").assignedInvoiceQuery(allowedPlayerIds) }
+      : { $or: [
         { players: playerId },
         ...(parentId ? [{ parent: parentId, $or: [{ players: { $exists: false } }, { players: { $size: 0 } }] }] : []),
-      ],
-    })
+      ] })
       .populate({ path: "class", select: "name term price", populate: { path: "term", select: "name year startDate endDate isEvent" } })
       .populate({ path: "team", select: "teamName teamFee term", populate: { path: "term", select: "name year startDate endDate isEvent" } })
       .populate({ path: "league", select: "name fee term season", populate: { path: "term", select: "name year startDate endDate isEvent" } })
       .populate({ path: "event", select: "title eventType category termId", populate: { path: "termId", select: "name year startDate endDate isEvent" } })
       .sort({ createdAt: -1 })
-      .lean();
+      .lean() : [];
 
     const invoiceIds = playerInvoices.map((invoice) => invoice._id);
     const [availableTerms, productOrders, eventRegistrations, leaguePlayerStatistics] = await Promise.all([
       Term.find({}).select("name year startDate endDate isEvent status").sort({ startDate: -1 }).lean(),
-      parentId
-        ? Order.find({ parent: parentId }).populate("items.product", "name image sku").populate("invoice").sort({ createdAt: -1 }).lean()
+      canReadOrders && parentId
+        ? Order.find(assignedOnly ? { invoice: { $in: invoiceIds } } : { parent: parentId }).populate("items.product", "name image sku").populate("invoice").sort({ createdAt: -1 }).lean()
         : [],
-      EventRegistration.find({ user: playerId, status: { $ne: "CANCELLED" } })
+      canReadEvents ? EventRegistration.find({ user: playerId, status: { $ne: "CANCELLED" } })
         .populate({ path: "event", select: "title eventType category termId startDate endDate", populate: { path: "termId", select: "name year startDate endDate isEvent" } })
         .populate("invoice")
-        .sort({ createdAt: -1 }).lean(),
-      PlayerStatistics.find({ player: playerId })
+        .sort({ createdAt: -1 }).lean() : [],
+      canReadLeagues ? PlayerStatistics.find({ player: playerId, ...(assignedOnly ? { team: { $in: assignedTeamIds } } : {}) })
         .populate({ path: "league", select: "name season term startDate endDate", populate: { path: "term", select: "name year startDate endDate isEvent" } })
         .populate("team", "teamName")
-        .sort({ updatedAt: -1 }).lean(),
+        .sort({ updatedAt: -1 }).lean() : [],
     ]);
+    if (assignedOnly) {
+      const safeInvoiceIds = new Set(invoiceIds.map(String));
+      eventRegistrations.forEach((registration) => {
+        if (registration.invoice && !safeInvoiceIds.has(String(registration.invoice?._id || registration.invoice))) registration.invoice = null;
+      });
+    }
 
     const allInvoiceIds = [...new Set([
       ...invoiceIds.map((id) => id.toString()),
       ...productOrders.map((order) => String(order.invoice?._id || order.invoice || "")),
       ...eventRegistrations.map((registration) => String(registration.invoice?._id || registration.invoice || "")),
     ].filter(Boolean))];
-    const invoicePayments = allInvoiceIds.length
+    const invoicePayments = canReadPayments && allInvoiceIds.length
       ? await Payment.find({ invoice: { $in: allInvoiceIds } })
         .select("invoice amount status approvedAt createdAt paymentMethod transactionId remarks")
         .lean()
@@ -4844,11 +4974,11 @@ exports.getPlayerDetails = async (req, res) => {
       assignedClassesWithPaymentStatus: assignedClassesPaymentInfo,
     };
 
-    const assignedTeams = await Team.find({ "players.player": playerId })
+    const assignedTeams = canReadTeams ? await Team.find({ "players.player": playerId, ...(assignedOnly ? { _id: { $in: assignedTeamIds } } : {}) })
       .select("teamName teamFee logo players ageGroup term leagues")
       .populate("term", "name year startDate endDate isEvent")
       .populate({ path: "leagues.league", select: "name season term startDate endDate", populate: { path: "term", select: "name year startDate endDate isEvent" } })
-      .lean();
+      .lean() : [];
 
     const assignedTeamsPaymentInfo = assignedTeams.map((team) => {
       const pEntry = (team.players || []).find(
@@ -5216,14 +5346,14 @@ exports.getPlayerDetails = async (req, res) => {
       },
     }));
 
-    const teamAttendanceRecords = await Attendance.find({
-      team: { $exists: true, $ne: null },
+    const teamAttendanceRecords = canReadAttendance && canReadTeams ? await Attendance.find({
+      team: assignedOnly ? { $in: assignedTeamIds } : { $exists: true, $ne: null },
       "records.player": playerId,
     })
       .populate("team", "teamName ageGroup startTime endTime")
       .populate("records.noteAuthor", "name")
       .sort({ sessionDate: -1 })
-      .lean();
+      .lean() : [];
 
     const perDayTeamAttendance = teamAttendanceRecords.map((att) => {
       const playerRecord = att.records.find(
@@ -5269,6 +5399,7 @@ exports.getPlayerDetails = async (req, res) => {
       percentage: overallTeamAttendancePercentage,
     };
 
+    if (!canReadParents) player.parentId = null;
     return res.status(200).json({
       success: true,
       message: "Player details fetched successfully.",
@@ -7091,7 +7222,7 @@ exports.updatePlayer = async (req, res, next) => {
   const tx = await mongoose.startSession();
   let result; let oldImage; let committed = false;
   try {
-    if (!req.admin || !['ADMIN','SUPER_ADMIN'].includes(req.admin.role)) return res.status(403).json({ success: false, message: 'Admin access required' });
+    if (!require('../utils/coachPermissions').can(req.admin, 'players', 'edit')) return res.status(403).json({ success: false, message: 'Player edit access required' });
     const { playerId } = req.params;
     if (!mongoose.isValidObjectId(playerId)) return res.status(400).json({ success: false, message: 'Invalid player ID' });
     await tx.withTransaction(async () => {

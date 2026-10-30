@@ -56,7 +56,7 @@ exports.resetPassword = async (req, res, next) => {
     const Model = resetModel(role);
     if (!Model || !/^[a-f0-9]{24}$/i.test(String(userId)) || !/^[a-f0-9]{64}$/.test(String(resetToken || "")) || typeof newPassword !== "string" || newPassword.length < 8 || newPassword.length > 128) return res.status(400).json({ success: false, message: "A valid reset token and an 8–128 character password are required" });
     const password = await bcrypt.hash(newPassword, 12);
-    const user = await Model.findOneAndUpdate({ _id: userId, resetTokenHash: resetHash(resetToken), resetTokenExpire: { $gt: new Date() } }, { $set: { password, isOtpVerified: false, otpAttempts: 0, tokens: [] }, $unset: { resetTokenHash: 1, resetTokenExpire: 1, otp: 1, otpExpire: 1 } });
+    const user = await Model.findOneAndUpdate({ _id: userId, resetTokenHash: resetHash(resetToken), resetTokenExpire: { $gt: new Date() } }, { $set: { password, isOtpVerified: false, otpAttempts: 0, tokens: [], ...(Model === Admin ? { sessions: [], fcmTokens: [] } : {}) }, $unset: { resetTokenHash: 1, resetTokenExpire: 1, otp: 1, otpExpire: 1 } });
     if (!user) return res.status(400).json({ success: false, message: "Invalid, expired or already used reset token" });
     return res.json({ success: true, message: "Password reset. Sign in with your new password." });
   } catch (error) { return next(error); }
@@ -73,6 +73,13 @@ exports.changePassword = async (req, res, next) => {
     const password = await bcrypt.hash(newPassword, 12);
     const changed = await Model.updateOne({ _id: account._id, password: account.password, tokens: req.token }, { $set: { password, tokens: [req.token], isOtpVerified: false, otpAttempts: 0 }, $unset: { resetTokenHash: 1, resetTokenExpire: 1, otp: 1, otpExpire: 1 } });
     if (!changed.modifiedCount) return res.status(409).json({ success: false, message: "Account changed. Sign in and try again" });
+    if (Model === Admin) {
+      await Admin.updateOne({ _id: account._id }, { $pull: { sessions: { tokenHash: { $ne: require("../utils/sessionInfo").tokenHash(req.token) } } } });
+      const { clientIp, deviceInfo } = require("../utils/sessionInfo");
+      const device = deviceInfo(req);
+      await require("../models/AuditLog").create({ user: account._id, userRole: account.role, actorName: account.name || "", actorEmail: account.email || "", action: "PASSWORD_CHANGED", entityType: "Admin", entityId: account._id,
+        entityName: account.name || account.email, description: `${account.name || account.email} changed their password and signed out other devices`, ipAddress: clientIp(req), deviceInfo: device.userAgent, source: device.source });
+    }
     return res.json({ success: true, message: "Password changed; other sessions have been signed out" });
   } catch (error) { return next(error); }
 };
@@ -92,6 +99,7 @@ exports.getMyProfile = async (req, res) => {
 
     delete data.password;
     delete data.tokens;
+    delete data.sessions;
     delete data.otp;
     delete data.otpExpire;
 

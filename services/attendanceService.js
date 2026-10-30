@@ -5,6 +5,7 @@ const Class = require("../models/Class");
 const Team = require("../models/Team");
 const User = require("../models/User");
 const AuditLog = require("../models/AuditLog");
+const { clientIp, deviceInfo } = require("../utils/sessionInfo");
 const { dateOnlyStartUtc, dateOnlyEndUtc, dateOnly } = require("../utils/dateTime");
 const fail = (message, status = 400) => { throw Object.assign(new Error(message), { status }); };
 const sid = (value) => String(value?._id || value || "");
@@ -55,11 +56,13 @@ async function updateAttendance(req, kind, records) {
       const filter = { [kind]: resourceId, ...(kind === "team" ? { league: leagueId } : {}), sessionDate: { $gte: date, $lte: dateOnlyEndUtc(dateKey) } };
       let attendance = await Attendance.findOne(filter).session(session);
       if (!attendance) [attendance] = await Attendance.create([{ [kind]: resourceId, ...(kind === "team" ? { league: leagueId } : {}), sessionDate: date, records: [], markedBy: req.admin._id }], { session });
+      const changes = [];
       for (let i = 0; i < records.length; i++) {
         const previous = attendance.records.find((item) => sid(item.player) === ids[i]);
         const normalized = normalizeRecord(records[i], previous);
         const oldNote = previous?.note || previous?.reason || previous?.remarks || previous?.comment || "";
         if (!previous || normalized.status !== previous.status || normalized.note !== oldNote || normalized.attendanceType !== previous.attendanceType) {
+          changes.push({ player: ids[i], from: previous?.status || "NOT_MARKED", to: normalized.status, noteChanged: normalized.note !== oldNote });
           await AttendanceHistory.create([{ attendanceId: attendance._id, [`${kind}Id`]: resourceId, leagueId, sessionDate: date, playerId: ids[i], previousStatus: previous?.status || "NONE", newStatus: normalized.status, previousComment: oldNote, newComment: normalized.note, previousNote: oldNote, newNote: normalized.note, modifiedBy: req.admin._id, modificationReason: "Attendance or note updated" }], { session });
         }
         const patch = { ...normalized, ...(!previous || normalized.note !== oldNote ? { noteAuthor: req.admin._id, noteUpdatedAt: new Date() } : {}) };
@@ -68,7 +71,10 @@ async function updateAttendance(req, kind, records) {
       }
       attendance.markedBy = req.admin._id;
       await attendance.save({ session });
-      await AuditLog.create([{ user: req.admin._id, userRole: req.admin.role, action: "ATTENDANCE_UPDATED", entityType: "Attendance", entityId: attendance._id, description: `Attendance and notes updated on ${dateKey}`, ipAddress: req.ip || "", deviceInfo: req.headers?.["user-agent"] || "" }], { session });
+      const device = deviceInfo(req);
+      await AuditLog.create([{ user: req.admin._id, userRole: req.admin.role, actorName: req.admin.name || "", actorEmail: req.admin.email || "", action: "ATTENDANCE_UPDATED", entityType: "Attendance", entityId: attendance._id,
+        entityName: resource.name || resource.teamName || "Attendance", description: `${changes.length} player attendance record${changes.length === 1 ? "" : "s"} updated in ${resource.name || resource.teamName || kind} on ${dateKey}`,
+        newValue: { changes: changes.slice(0, 50), totalChanges: changes.length }, ipAddress: clientIp(req), deviceInfo: device.userAgent, source: device.source }], { session });
       result = attendance;
     });
     return result;

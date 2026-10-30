@@ -3,8 +3,9 @@ const Class = require("../models/Class");
 const Team = require("../models/Team");
 const Event = require("../models/Event");
 const CampSession = require("../models/CampSession");
+const { can, scopeFor } = require("../utils/coachPermissions");
 
-const privileged = (req) => ["SUPER_ADMIN", "ADMIN"].includes(req.admin?.role);
+const privileged = (req) => ["SUPER_ADMIN", "ADMIN"].includes(req.admin?.role) || (req.admin?.role === "COACH" && req.admin?.accessMode === "FULL");
 const requireStaff = (req, res, next) => {
   if (!req.admin || !["SUPER_ADMIN", "ADMIN", "COACH"].includes(req.admin.role) || req.admin.isActive === false) {
     return res.status(403).json({ success: false, message: "Active staff access required" });
@@ -16,6 +17,10 @@ const assigned = (resource, staff) => [resource.coach, resource.assistantCoach, 
 const resourceAccess = (Model, key) => async (req, res, next) => {
   if (!req.admin) return res.status(403).json({ success: false, message: "Staff access required" });
   if (privileged(req)) return next();
+  const module = key === "classId" ? (req.path.includes("Attendance") || req.path.includes("attendance") ? "attendance" : "classes") : "teams";
+  const action = /export/i.test(req.path) ? "export" : req.method === "GET" ? "read" : req.method === "DELETE" ? "delete" : "edit";
+  if (!can(req.admin, module, action)) return res.status(403).json({ success: false, message: "This coach permission is disabled" });
+  if (scopeFor(req.admin, module) === "ALL") return next();
   const resourceId = req.params[key] || req.body?.[key] || req.query[key];
   if (!mongoose.isValidObjectId(resourceId)) return res.status(400).json({ success: false, message: `A valid ${key} is required` });
   try {
@@ -29,6 +34,8 @@ const resourceAccess = (Model, key) => async (req, res, next) => {
 const requireEventAccess = async (req, res, next) => {
   if (!req.admin) return res.status(403).json({ success: false, message: "Staff access required" });
   if (privileged(req)) return next();
+  if (!can(req.admin, "events", req.method === "GET" ? "read" : "edit")) return res.status(403).json({ success: false, message: "This coach permission is disabled" });
+  if (scopeFor(req.admin, "events") === "ALL") return next();
   const eventId = req.params.eventId || req.body?.eventId || req.query.eventId;
   if (!mongoose.isValidObjectId(eventId)) return res.status(400).json({ success: false, message: "A valid eventId is required" });
   try {
@@ -42,6 +49,8 @@ const requireEventAccess = async (req, res, next) => {
 const requirePlayerAccess = async (req, res, next) => {
   if (privileged(req)) return next();
   if (!req.admin || req.admin.isActive === false) return res.status(403).json({ success: false, message: "Active staff access required" });
+  if (!can(req.admin, "players", req.method === "GET" ? "read" : "edit")) return res.status(403).json({ success: false, message: "This coach permission is disabled" });
+  if (scopeFor(req.admin, "players") === "ALL") return next();
   const player = req.params.playerId || req.body?.player || req.body?.playerId;
   if (!mongoose.isValidObjectId(player)) return res.status(400).json({ success: false, message: "A valid player ID is required" });
   try {
@@ -54,6 +63,8 @@ const requirePlayerAccess = async (req, res, next) => {
 };
 const requireTrainingAccess = async (req, res, next) => {
   if (privileged(req)) return next();
+  if (!can(req.admin, "classes", "edit")) return res.status(403).json({ success: false, message: "This coach permission is disabled" });
+  if (scopeFor(req.admin, "classes") === "ALL") return next();
   try {
     const training = await require("../models/TrainingSession").findById(req.params.sessionId).select("coach class");
     if (!training) return res.status(404).json({ success: false, message: "Training session not found" });

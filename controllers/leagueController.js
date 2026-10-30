@@ -1051,6 +1051,10 @@ exports.getAllLeagues = async (req, res) => {
     const skip = (page - 1) * limit;
 
     const filter = { archivedAt: null };
+    if (req.staffScope?.scope === "ASSIGNED") {
+      const teamIds = await Team.find(require("../middleware/isAdmin").assignedTeamQuery(req.admin._id)).distinct("_id");
+      filter.teams = { $in: teamIds };
+    }
 
     if (search) {
       filter.$or = [
@@ -1396,6 +1400,9 @@ exports.getAllTeams = async (req, res) => {
     const skip = (page - 1) * limit;
 
     const filter = { archivedAt: null };
+    if (req.staffScope?.scope === "ASSIGNED") {
+      filter.$and = [require("../middleware/isAdmin").assignedTeamQuery(req.admin._id)];
+    }
 
     if (search) {
       const coaches = await Admin.find({ name: { $regex: escapeRegex(search), $options: "i" } }).distinct("_id");
@@ -1522,8 +1529,12 @@ exports.getAvailablePlayers = async (req, res) => {
       }
     });
 
+    const assignedIds = req.staffScope?.scope === "ASSIGNED"
+      ? await require("../middleware/isAdmin").assignedPlayerIds(req.admin._id)
+      : null;
     const allPlayers = await User.find({
       isBlocked: false,
+      ...(assignedIds ? { _id: { $in: assignedIds } } : {}),
     })
       .populate("category", "name")
       .populate("programs", "name")
@@ -1810,6 +1821,12 @@ exports.getTeamById = async (req, res) => {
     }
 
     const teamObj = team.toObject ? team.toObject() : { ...team };
+    if (!require("../utils/coachPermissions").can(req.admin, "parents", "read")) {
+      for (const entry of teamObj.players || []) if (entry.player && typeof entry.player === "object") entry.player.parentId = null;
+      for (const league of teamObj.leagues || []) {
+        for (const entry of league.players || []) if (entry.player && typeof entry.player === "object") entry.player.parentId = null;
+      }
+    }
 
     // Format leagues with full detail and per-league metrics
     const rawLeagues = Array.isArray(teamObj.leagues) ? teamObj.leagues : [];
@@ -2066,7 +2083,7 @@ exports.getTeamPlayers = async (req, res) => {
             },
             category: pObj.category || null,
             programs: pObj.programs || [],
-            parentId: pObj.parentId || null,
+            parentId: require("../utils/coachPermissions").can(req.admin, "parents", "read") ? pObj.parentId || null : null,
             rating: pObj.rating || null,
             club: pObj.club || "",
           };

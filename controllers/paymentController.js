@@ -396,12 +396,20 @@ exports.getAdminPayments = async (req, res) => {
     } = req.query;
 
     const query = {};
+    if (req.staffScope?.scope === "ASSIGNED") {
+      const ids = await require("../middleware/isAdmin").assignedPlayerIds(req.admin._id);
+      const invoiceIds = await Invoice.find(require("../middleware/isAdmin").assignedInvoiceQuery(ids)).distinct("_id");
+      query.invoice = { $in: invoiceIds };
+    }
 
     if (status) query.status = status;
     const activeMethod = paymentMethod || method;
     if (activeMethod) query.paymentMethod = activeMethod;
     if (parent) query.parent = parent;
-    if (invoice) query.invoice = invoice;
+    if (invoice) {
+      if (req.staffScope?.scope === "ASSIGNED") query.$and = [...(query.$and || []), { invoice }];
+      else query.invoice = invoice;
+    }
 
     if (startDate || endDate) {
       query.createdAt = {};

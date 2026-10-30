@@ -225,8 +225,20 @@ const {
 } = require("../controllers/registrationRequestController");
 
 const router = express.Router();
+const { getCoachAccess, updateCoachAccess } = require("../controllers/coachAccessController");
 router.post("/login", require("../middleware/authRateLimit"), adminLogin);
 router.use(auth, requireStaff);
+router.use(require("../middleware/auditMutations"));
+const sessionController = require("../controllers/adminSessionController");
+router.get("/sessions", sessionController.listSessions);
+router.delete("/sessions", sessionController.revokeAllSessions);
+router.delete("/sessions/:sessionId", sessionController.revokeSession);
+router.get("/coaches/:coachId/sessions", sessionController.listSessions);
+router.delete("/coaches/:coachId/sessions", sessionController.revokeAllSessions);
+router.delete("/coaches/:coachId/sessions/:sessionId", sessionController.revokeSession);
+router.get("/global-search", require("../controllers/globalSearchController").globalSearch);
+router.get("/coaches/:coachId/access", getCoachAccess);
+router.put("/coaches/:coachId/access", updateCoachAccess);
 
 // Registration Requests & Enrollment Workflow (Admin)
 router.get("/registration-requests", auth, isAdmin, getRegistrationRequests);

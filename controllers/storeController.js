@@ -364,12 +364,22 @@ exports.getProductInsights = async (req, res) => {
     }
 
     const productId = new mongoose.Types.ObjectId(id);
+    const { can, scopeFor } = require("../utils/coachPermissions");
+    const canReadOrders = can(req.admin, "orders", "read");
+    const canReadReports = can(req.admin, "reports", "read");
+    const visibleInvoiceIds = canReadOrders && scopeFor(req.admin, "orders") === "ASSIGNED"
+      ? await Invoice.find(require("../middleware/isAdmin").assignedInvoiceQuery(await require("../middleware/isAdmin").assignedPlayerIds(req.admin._id))).distinct("_id")
+      : null;
+    const orderFilter = {
+      "items.product": productId,
+      ...(visibleInvoiceIds ? { invoice: { $in: visibleInvoiceIds } } : {}),
+    };
     const page = Math.max(1, parseInt(req.query.page, 10) || 1);
     const limit = Math.min(50, Math.max(1, parseInt(req.query.limit, 10) || 10));
     const paid = { $and: [{ $ne: ["$status", "CANCELLED"] }, { $eq: ["$paymentStatus", "PAID"] }] };
     const active = { $ne: ["$status", "CANCELLED"] };
-    const summaryRows = await Order.aggregate([
-      { $match: { "items.product": productId } },
+    const summaryRows = canReadReports || canReadOrders ? await Order.aggregate([
+      { $match: canReadReports ? { "items.product": productId } : orderFilter },
       { $unwind: "$items" },
       { $match: { "items.product": productId } },
       { $group: {
@@ -399,20 +409,20 @@ exports.getProductInsights = async (req, res) => {
         paidRevenueMinor: 1, pendingRevenueMinor: 1, cancelledOrders: 1, refundedOrders: 1,
         buyerCount: { $size: { $setDifference: ["$paidBuyers", [null]] } },
       } },
-    ]);
+    ]) : [];
     const summary = summaryRows[0] || {
       orderCount: 0, unitsOrdered: 0, unitsSold: 0, paidRevenueMinor: 0,
       pendingRevenueMinor: 0, cancelledOrders: 0, refundedOrders: 0, buyerCount: 0,
     };
 
-    const orders = await Order.find({ "items.product": productId })
+    const orders = canReadOrders ? await Order.find(orderFilter)
       .select("parent items paymentStatus status invoice createdAt currency")
       .populate("parent", "fullName email phone")
       .populate("invoice", "invoiceNumber paymentStatus")
       .sort({ createdAt: -1, _id: -1 })
       .skip((page - 1) * limit)
       .limit(limit)
-      .lean();
+      .lean() : [];
     const orderRows = orders.map((order) => {
       const lines = order.items.filter((item) => String(item.product) === id);
       const quantity = lines.reduce((sum, item) => sum + Number(item.quantity || 0), 0);
@@ -420,7 +430,7 @@ exports.getProductInsights = async (req, res) => {
         (item.priceMinor == null ? Math.round(Number(item.price || 0) * 100) : Number(item.priceMinor)), 0);
       return {
         _id: order._id,
-        parent: order.parent,
+        parent: can(req.admin, "parents", "read") ? order.parent : null,
         quantity,
         lineTotalMinor,
         variants: lines.map((item) => ({ size: item.selectedSize, color: item.selectedColor, quantity: item.quantity })),
@@ -431,6 +441,7 @@ exports.getProductInsights = async (req, res) => {
         currency: order.currency || "AUD",
       };
     });
+    const visibleOrderCount = canReadOrders ? await Order.countDocuments(orderFilter) : 0;
 
     return res.status(200).json({
       success: true,
@@ -438,7 +449,7 @@ exports.getProductInsights = async (req, res) => {
         product,
         summary,
         orders: orderRows,
-        pagination: { page, limit, total: summary.orderCount, totalPages: Math.ceil(summary.orderCount / limit) },
+        pagination: { page, limit, total: visibleOrderCount, totalPages: Math.ceil(visibleOrderCount / limit) },
       },
     });
   } catch (error) {
@@ -818,6 +829,11 @@ exports.getAllOrders = async (req, res) => {
     } = req.query;
 
     const query = {};
+    if (req.staffScope?.scope === "ASSIGNED") {
+      const ids = await require("../middleware/isAdmin").assignedPlayerIds(req.admin._id);
+      const invoiceIds = await Invoice.find(require("../middleware/isAdmin").assignedInvoiceQuery(ids)).distinct("_id");
+      query.invoice = { $in: invoiceIds };
+    }
 
     if (status) {
       query.status = status;

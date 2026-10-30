@@ -359,7 +359,7 @@ exports.getClassDropdown = async (req, res) => {
   try {
     const adminId = req.admin._id;
 
-    const admin = await Admin.findById(adminId).select("role");
+    const admin = await Admin.findById(adminId).select("role accessMode");
 
     if (!admin) {
       return res.status(404).json({
@@ -372,7 +372,7 @@ exports.getClassDropdown = async (req, res) => {
       status: "ACTIVE",
     };
 
-    if (admin.role === "COACH") {
+    if (admin.role === "COACH" && admin.accessMode !== "FULL") {
       query.$and = query.$and || [];
       query.$and.push({
         $or: [
@@ -442,10 +442,15 @@ exports.getAssignedClassById = async (req, res) => {
       return res.status(404).json({ success: false, message: "Class not found" });
     }
 
-    const attendanceRecords = await Attendance.find({ class: classId })
+    const { can } = require("../utils/coachPermissions");
+    if (!can(req.admin, "parents", "read")) {
+      for (const player of cls.players || []) player.parentId = null;
+    }
+
+    const attendanceRecords = can(req.admin, "attendance", "read") ? await Attendance.find({ class: classId })
       .select("sessionDate records markedBy createdAt updatedAt")
       .populate("markedBy", "name email")
-      .sort({ sessionDate: -1 });
+      .sort({ sessionDate: -1 }) : [];
 
     const playerAttendanceMap = {};
 
@@ -640,20 +645,6 @@ exports.getPlayerProfile = async (req, res) => {
       return res.status(400).json({ success: false, message: "Invalid player ID" });
     }
 
-    if (req.admin.role === "COACH") {
-      const assignedClasses = await Class.find({
-        $or: [{ coach: coachId }, { assistantCoach: coachId }],
-        players: playerId,
-      }).select("_id");
-
-      if (assignedClasses.length === 0) {
-        return res.status(403).json({
-          success: false,
-          message: "Access denied. Player is not in your assigned classes.",
-        });
-      }
-    }
-
     const player = await User.findById(playerId)
       .populate({
         path: "parentId",
@@ -669,20 +660,28 @@ exports.getPlayerProfile = async (req, res) => {
       return res.status(404).json({ success: false, message: "Player not found" });
     }
 
+    const { can, scopeFor } = require("../utils/coachPermissions");
     const medicalProfile = await MedicalProfile.findOne({ player: playerId }).lean();
+    const assignedClassIds = scopeFor(req.admin, "classes") === "ASSIGNED"
+      ? await Class.find({ $or: [{ coach: coachId }, { assistantCoach: coachId }] }).distinct("_id")
+      : null;
 
-    const teams = await Team.find({ "players.player": playerId })
+    const teams = can(req.admin, "teams", "read") ? await Team.find({
+      "players.player": playerId,
+      ...(scopeFor(req.admin, "teams") === "ASSIGNED" ? { $or: [{ coach: coachId }, { assistantCoach: coachId }] } : {}),
+    })
       .select("teamName ageGroup coach")
       .populate("coach", "name")
-      .lean();
-    const attendanceRecords = await Attendance.find({
+      .lean() : [];
+    const attendanceRecords = can(req.admin, "attendance", "read") ? await Attendance.find({
       "records.player": playerId,
+      ...(assignedClassIds && scopeFor(req.admin, "attendance") === "ASSIGNED" ? { class: { $in: assignedClassIds } } : {}),
     })
       .select("class sessionDate records")
       .populate("class", "name dayOfWeek")
       .sort({ sessionDate: -1 })
       .limit(50)
-      .lean();
+      .lean() : [];
 
     const attendanceHistory = attendanceRecords.map((att) => {
       const playerRecord = att.records.find(
@@ -699,11 +698,11 @@ exports.getPlayerProfile = async (req, res) => {
       };
     });
 
-    const coachNotes = await CoachNote.find({ player: playerId })
+    const coachNotes = can(req.admin, "notes", "read") ? await CoachNote.find({ player: playerId, coach: coachId })
       .populate("coach", "name")
       .populate("classId", "name")
       .sort({ createdAt: -1 })
-      .lean();
+      .lean() : [];
 
     const currentAge = ageGroupForYear(player.dob);
 
@@ -714,7 +713,7 @@ exports.getPlayerProfile = async (req, res) => {
       injuries: medicalProfile?.injuries || [],
       medications: medicalProfile?.medications || [],
       medicalConditions: medicalProfile?.medicalConditions || "",
-      emergencyContact: player.parentId?.emergencyContact || medicalProfile?.emergencyContact || "",
+      emergencyContact: can(req.admin, "parents", "read") ? player.parentId?.emergencyContact || medicalProfile?.emergencyContact || "" : "",
     };
 
     res.json({
@@ -741,12 +740,12 @@ exports.getPlayerProfile = async (req, res) => {
           medicalConditionDetails: player.medicalConditionDetails,
         },
 
-        parent: player.parentId,
+        parent: can(req.admin, "parents", "read") ? player.parentId : null,
 
         category: player.category,
         programs: player.programs,
         term: player.term,
-        assignedClasses: player.assignedClasses,
+        assignedClasses: can(req.admin, "classes", "read") ? (assignedClassIds ? (player.assignedClasses || []).filter((item) => assignedClassIds.some((id) => String(id) === String(item._id))) : player.assignedClasses) : [],
         teams,
 
         attendanceHistory,
@@ -788,6 +787,8 @@ exports.getClassPlayers = async (req, res) => {
       return res.status(404).json({ success: false, message: "Class not found" });
     }
 
+    const showParents = require("../utils/coachPermissions").can(req.admin, "parents", "read");
+
     const players = classData.players.map((p) => ({
       _id: p._id,
       fullName: p.fullName,
@@ -797,7 +798,7 @@ exports.getClassPlayers = async (req, res) => {
       rating: p.rating,
       hasMedicalAlert: p.isMedicalCondition || false,
       medicalConditionDetails: p.medicalConditionDetails || "",
-      parent: p.parentId
+      parent: showParents && p.parentId
         ? {
           _id: p.parentId._id,
           fullName: p.parentId.fullName,
@@ -840,19 +841,7 @@ exports.getUniquePlayersByCoach = async (req, res) => {
       });
     }
 
-    const coachClasses = await Class.find({
-      $or: [{ coach: coachId }, { assistantCoach: coachId }],
-      status: "ACTIVE",
-    }).select("players");
-
-    const playerIdsSet = new Set();
-    coachClasses.forEach((cls) => {
-      (cls.players || []).forEach((pId) => {
-        if (pId) playerIdsSet.add(pId.toString());
-      });
-    });
-
-    const playerIds = Array.from(playerIdsSet);
+    const playerIds = await require("../middleware/isAdmin").assignedPlayerIds(coachId);
 
     const query = {
       _id: { $in: playerIds },
@@ -869,8 +858,11 @@ exports.getUniquePlayersByCoach = async (req, res) => {
 
     const total = await User.countDocuments(query);
 
-    const users = await User.find(query)
-      .populate("parentId", "fullName email phone address city state postcode country emergencyContact relationship")
+    let usersQuery = User.find(query);
+    if (require("../utils/coachPermissions").can(req.admin, "parents", "read")) {
+      usersQuery = usersQuery.populate("parentId", "fullName email phone address city state postcode country emergencyContact relationship");
+    }
+    const users = await usersQuery
       .populate("category", "name")
       .populate("programs", "name")
       .populate({
@@ -1125,6 +1117,7 @@ exports.getPlayerDetails = async (req, res) => {
       percentage: overallTeamAttendancePercentage,
     };
 
+    if (!require("../utils/coachPermissions").can(req.admin, "parents", "read")) player.parentId = null;
     return res.status(200).json({
       success: true,
       message: "Player details fetched successfully.",
