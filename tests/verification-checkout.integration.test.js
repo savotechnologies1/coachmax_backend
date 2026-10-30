@@ -19,7 +19,7 @@ const RegistrationRequest = require("../models/RegistrationRequest");
 const AuditLog = require("../models/AuditLog");
 const Invoice = require("../models/Invoice");
 const Counter = require("../models/Counter");
-const DeliveryJob = require("../models/DeliveryJob");
+const Notification = require("../models/Notification");
 const Product = require("../models/Product");
 const Cart = require("../models/Cart");
 const Order = require("../models/Order");
@@ -40,7 +40,7 @@ const { canReadMedia } = require("../middleware/privateMedia");
 const { enrollPlayer } = require("../services/enrollmentService");
 const { activateAssignedPlayers } = require("../services/activateAssignedPlayers");
 const { checkout, createCheckoutService } = require("../services/checkoutService");
-const allModels = [User, Parent, Class, Term, Program, Category, RegistrationRequest, AuditLog, Invoice, Counter, DeliveryJob, Product, Cart, Order, MedicalProfile, MedicalRevision, Attendance, AttendanceHistory, ChatRoom, Message];
+const allModels = [User, Parent, Class, Term, Program, Category, RegistrationRequest, AuditLog, Invoice, Counter, Notification, Product, Cart, Order, MedicalProfile, MedicalRevision, Attendance, AttendanceHistory, ChatRoom, Message];
 let replica;
 let testDbPath;
 const testTempRoot = path.resolve(__dirname, "../.test-tmp");
@@ -94,7 +94,7 @@ test("real transactions serialize the last class place, one invoice and one requ
   assert.equal(await RegistrationRequest.countDocuments({ status: "APPROVED" }), 1);
   assert.equal(await RegistrationRequest.countDocuments({ status: "PENDING" }), 1);
   assert.equal(await User.countDocuments({ playerStatus: "ACTIVE" }), 1);
-  assert.equal(await DeliveryJob.countDocuments({ status: "PENDING" }), 2);
+  assert.equal(await Notification.countDocuments({ deliveryKind: "NOTIFICATION", deliveryStatus: "PENDING" }), 2);
 });
 
 test("concurrent duplicate allocation converges to one charge and preserves other pending requests", async () => {
@@ -170,7 +170,7 @@ test("an assigned player leaves the verification queue and becomes active in Pla
   const f = await enrollmentFixture();
   const request = f.requests[0];
 
-  await activateAssignedPlayers([f.players[0]._id]);
+  await activateAssignedPlayers([f.players[0]._id], { registrationRequestIds: [request._id] });
 
   const resolvedRequest = await RegistrationRequest.findById(request._id);
   const activePlayer = await User.findById(f.players[0]._id);
@@ -201,7 +201,7 @@ test("real checkout concurrency cannot sell the last stock unit twice", async ()
   assert.equal(await Order.countDocuments(), 1);
   assert.equal(await Invoice.countDocuments(), 1);
   assert.equal(await Cart.countDocuments({ "items.0": { $exists: true } }), 1);
-  assert.equal(await DeliveryJob.countDocuments(), 2);
+  assert.equal(await Notification.countDocuments({ deliveryKind: "NOTIFICATION", deliveryStatus: "PENDING" }), 2);
 });
 
 test("real simultaneous checkout retries produce the same order and invoice", async () => {
@@ -356,11 +356,11 @@ test("temporary onboarding queues password setup with no reusable credential and
     assert.equal(result.statusCode, 201);
     assert.equal(result.body.emailQueued, true);
     assert.equal(result.body.data.tempPasswordGenerated, false);
-    const email = await DeliveryJob.findOne({ kind: "EMAIL" });
+    const email = await Notification.collection.findOne({ deliveryKind: "EMAIL" });
     assert.ok(email);
-    assert.match(email.payload.html, /forgot-password\?role=PARENT/);
-    assert.doesNotMatch(email.payload.html, /Temporary password|Password<\/b>/i);
-    assert.equal(email.status, "PENDING");
+    assert.match(email.deliveryPayload.html, /forgot-password\?role=PARENT/);
+    assert.doesNotMatch(email.deliveryPayload.html, /Temporary password|Password<\/b>/i);
+    assert.equal(email.deliveryStatus, "PENDING");
     const existing = response();
     await createTemporaryPlayer({ body: { ...body, name: "Sibling trial", parentEmail: f.household.email, parentPhone: f.household.phone }, admin: actor, headers: {} }, existing);
     assert.equal(existing.statusCode, 201);

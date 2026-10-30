@@ -41,13 +41,16 @@ const queueEmail = (key, payload, session) => Notification.updateOne({ idempoten
 async function processDeliveryJobs({ sendEmailFn = sendEmail, sendNotificationFn = sendNotification } = {}) {
   for (let count = 0; count < 50; count++) {
     const now = new Date();
-    const notification = await Notification.findOneAndUpdate({
+    // Use the native collection because normal Notification queries hide
+    // delivery-only records from user-facing notification lists.
+    const result = await Notification.collection.findOneAndUpdate({
       deliveryKind: { $in: ["NOTIFICATION", "EMAIL"] },
       $or: [
         { deliveryStatus: "PENDING", deliveryNextAttempt: { $lte: now } },
         { deliveryStatus: "SENDING", deliveryLockedUntil: { $lt: now } },
       ],
-    }, { $set: { deliveryStatus: "SENDING", deliveryLockedUntil: new Date(Date.now() + 60000) }, $inc: { deliveryAttempts: 1 } }, { new: true, sort: { deliveryNextAttempt: 1 } });
+    }, { $set: { deliveryStatus: "SENDING", deliveryLockedUntil: new Date(Date.now() + 60000) }, $inc: { deliveryAttempts: 1 } }, { returnDocument: "after", sort: { deliveryNextAttempt: 1 } });
+    const notification = result && Object.prototype.hasOwnProperty.call(result, "value") ? result.value : result;
     if (notification) {
       const attempts = notification.deliveryAttempts;
       try {
@@ -57,9 +60,9 @@ async function processDeliveryJobs({ sendEmailFn = sendEmail, sendNotificationFn
         } else {
           await sendNotificationFn({ ...notification.deliveryPayload, idempotencyKey: notification.idempotencyKey, awaitPush: true });
         }
-        await Notification.updateOne({ _id: notification._id, deliveryAttempts: attempts }, { $set: { deliveryStatus: "SENT" }, $unset: { deliveryLockedUntil: 1, deliveryLastError: 1 } });
+        await Notification.collection.updateOne({ _id: notification._id, deliveryAttempts: attempts }, { $set: { deliveryStatus: "SENT" }, $unset: { deliveryLockedUntil: 1, deliveryLastError: 1 } });
       } catch (error) {
-        await Notification.updateOne({ _id: notification._id, deliveryAttempts: attempts }, { $set: { deliveryStatus: attempts >= 8 ? "FAILED" : "PENDING", deliveryNextAttempt: new Date(Date.now() + Math.min(3600000, 30000 * 2 ** attempts)), deliveryLastError: "Delivery failed" }, $unset: { deliveryLockedUntil: 1 } });
+        await Notification.collection.updateOne({ _id: notification._id, deliveryAttempts: attempts }, { $set: { deliveryStatus: attempts >= 8 ? "FAILED" : "PENDING", deliveryNextAttempt: new Date(Date.now() + Math.min(3600000, 30000 * 2 ** attempts)), deliveryLastError: "Delivery failed" }, $unset: { deliveryLockedUntil: 1 } });
       }
       continue;
     }

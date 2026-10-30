@@ -38,7 +38,7 @@ test("runtime index gate validates uniqueness and partial scope, independently o
 
 test("required indexes cover enrollment, results, charges, delivery, checkout and attendance", () => {
   const required = criticalIndexRequirements();
-  for (const model of ["Team", "Fixture", "Standing", "PlayerStatistics", "Invoice", "Counter", "DeliveryJob", "Notification", "Order", "RegistrationRequest", "Attendance", "Parent", "Admin"]) assert.ok(required.some((index) => index.model === model), model);
+  for (const model of ["Team", "Fixture", "Standing", "PlayerStatistics", "Invoice", "Counter", "Notification", "Order", "RegistrationRequest", "Attendance", "Parent", "Admin"]) assert.ok(required.some((index) => index.model === model), model);
   assert.ok(required.some((index) => index.model === "Invoice" && index.key.chargeKey && index.options.unique));
   assert.ok(required.some((index) => index.model === "Fixture" && index.key.participants && index.options.unique));
 });

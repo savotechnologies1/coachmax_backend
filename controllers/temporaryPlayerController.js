@@ -7,7 +7,7 @@ const AuditLog = require("../models/AuditLog");
 const Class = require("../models/Class");
 const RegistrationRequest = require("../models/RegistrationRequest");
 const { temporaryPlayerAccessEmail } = require("../utils/emailTemplates");
-const sendEmail = require("../utils/sendEmail");
+const { queueEmail } = require("../services/deliveryService");
 const bcrypt = require("bcryptjs");
 const crypto = require("crypto");
 const mongoose = require("mongoose");
@@ -266,19 +266,20 @@ exports.createTemporaryPlayer = async (req, res) => {
       { session }
     );
 
+    let emailQueued = false;
+    if (appLoginUrl) {
+      await queueEmail(`temporary-player-access:${player._id}`, {
+        to: parent.email,
+        subject: isNewAccount ? "Set up your CoachMax account" : "A temporary player was added to your CoachMax account",
+        html: temporaryPlayerAccessEmail({ parentName: parent.fullName || parentName, playerName: player.fullName, email: parent.email, isNewAccount,
+          loginUrl: isNewAccount ? new URL("/forgot-password?role=PARENT", appLoginUrl).toString() : appLoginUrl }),
+      }, session);
+      emailQueued = true;
+    }
+
     await session.commitTransaction();
     transactionCommitted = true;
     await session.endSession();
-
-    let emailSent = false;
-    if (appLoginUrl) {
-      emailSent = await sendEmail(
-        parent.email,
-        isNewAccount ? "Set up your CoachMax account" : "A temporary player was added to your CoachMax account",
-        temporaryPlayerAccessEmail({ parentName: parent.fullName || parentName, playerName: player.fullName, email: parent.email, isNewAccount,
-          loginUrl: isNewAccount ? new URL("/forgot-password?role=PARENT", appLoginUrl).toString() : appLoginUrl })
-      );
-    }
 
     try {
       const { sendNotification } = require("../services/notificationService");
@@ -303,8 +304,8 @@ exports.createTemporaryPlayer = async (req, res) => {
       : "Temporary player created.";
     if (!appLoginUrl) {
       message += " Parent access email was not sent because the parent app URL is not configured.";
-    } else if (emailSent) {
-      message += isNewAccount ? " A password-setup email was sent to the parent." : " A parent update email was sent.";
+    } else if (emailQueued) {
+      message += isNewAccount ? " A password-setup email was queued for the parent." : " A parent update email was queued.";
     } else {
       message += " The player was created, but the parent access email could not be sent.";
     }
@@ -312,7 +313,8 @@ exports.createTemporaryPlayer = async (req, res) => {
     res.status(201).json({
       success: true,
       message,
-      emailSent,
+      emailSent: false,
+      emailQueued,
       contactDetailsReused,
       data: {
         player,
