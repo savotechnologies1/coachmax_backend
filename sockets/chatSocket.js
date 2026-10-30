@@ -189,7 +189,7 @@ const initSocket = (server, { sessionCheckIntervalMs = 15000 } = {}) => {
     };
     if (socket.tokenExpiresAt) { expiryTimer = setTimeout(expire, Math.max(0, Math.min(socket.tokenExpiresAt - Date.now(), 2147483647))); expiryTimer.unref?.(); }
     resources.set(socket.id, () => { clearInterval(interval); clearTimeout(expiryTimer); });
-    console.log(`⚡ Socket connected: ${socket.id} (User: ${userIdStr}, Role: ${socket.role})`);
+    console.log(`${process.env.NODE_ENV === "test" ? "[socket]" : "⚡"} Socket connected: ${socket.id} (User: ${userIdStr}, Role: ${socket.role})`);
 
     // ─────────────────────────────────────────────
     //  Online / Offline Status Tracking
@@ -716,7 +716,7 @@ const initSocket = (server, { sessionCheckIntervalMs = 15000 } = {}) => {
     socket.on("disconnect", () => {
       resources.get(socket.id)?.();
       resources.delete(socket.id);
-      console.log(`🔌 Socket disconnected: ${socket.id}`);
+      console.log(`${process.env.NODE_ENV === "test" ? "[socket]" : "🔌"} Socket disconnected: ${socket.id}`);
 
       const userTrack = onlineUsersMap.get(userIdStr);
       if (userTrack) {
