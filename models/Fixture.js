@@ -69,13 +69,20 @@ const fixtureSchema = new mongoose.Schema(
         scorer: {
           type: mongoose.Schema.Types.ObjectId,
           ref: "User",
-          required: true,
+          default: null,
         },
+        externalScorerId: { type: String, default: "" },
+        externalScorerName: { type: String, trim: true, default: "" },
+        externalScorerJerseyNumber: { type: String, trim: true, default: "" },
+        unknownScorer: { type: Boolean, default: false },
         assist: {
           type: mongoose.Schema.Types.ObjectId,
           ref: "User",
           default: null,
         },
+        externalAssistId: { type: String, default: "" },
+        externalAssistName: { type: String, trim: true, default: "" },
+        externalAssistJerseyNumber: { type: String, trim: true, default: "" },
         minute: {
           type: Number,
           required: true,
@@ -115,8 +122,13 @@ const fixtureSchema = new mongoose.Schema(
     }],
     status: {
       type: String,
-      enum: ["SCHEDULED", "LIVE", "COMPLETED", "POSTPONED"],
+      enum: ["SCHEDULED", "LIVE", "COMPLETED", "POSTPONED", "CANCELLED"],
       default: "SCHEDULED",
+    },
+    cancellationReason: {
+      type: String,
+      default: "",
+      maxlength: 1000,
     },
     fixtureSource: {
       type: String,

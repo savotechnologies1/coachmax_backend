@@ -615,11 +615,18 @@ exports.approvePayment = async (req, res) => {
       const filter = invoice.eventRegistration
         ? { _id: invoice.eventRegistration }
         : { invoice: invoice._id };
-      await EventRegistration.updateMany(
-        filter,
-        { paymentStatus: "PAID", status: "REGISTERED" },
-        { session }
-      );
+      const registrations = await EventRegistration.find(filter).session(session);
+      for (const registration of registrations) {
+        if (registration.status !== "REGISTERED") continue;
+        const outstanding = await Invoice.exists({
+          $or: [{ eventRegistration: registration._id }, { _id: registration.invoice }],
+          status: "ACTIVE",
+          paymentStatus: { $ne: "PAID" },
+          totalAmount: { $gt: 0 },
+        }).session(session);
+        registration.paymentStatus = outstanding ? "UNPAID" : "PAID";
+        await registration.save({ session });
+      }
     }
 
     await session.commitTransaction();

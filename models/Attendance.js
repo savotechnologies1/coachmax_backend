@@ -32,6 +32,18 @@ const attendanceSchema = new mongoose.Schema(
       required: true,
     },
 
+    sessionStatus: {
+      type: String,
+      enum: ["SCHEDULED", "CANCELLED"],
+      default: "SCHEDULED",
+    },
+    sessionCancellationReason: { type: String, default: "", maxlength: 500 },
+    sessionCancelledBy: { type: mongoose.Schema.Types.ObjectId, ref: "Admin" },
+    sessionCancelledAt: Date,
+    sessionNote: { type: String, default: "", maxlength: 1000 },
+    sessionNoteAuthor: { type: mongoose.Schema.Types.ObjectId, ref: "Admin" },
+    sessionNoteUpdatedAt: Date,
+
     trainingSessionId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "TrainingSession",

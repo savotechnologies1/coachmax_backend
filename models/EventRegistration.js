@@ -57,6 +57,16 @@ const eventRegistrationSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.ObjectId,
       ref: "Invoice",
     },
+    sessionChangeHistory: [
+      {
+        changedAt: { type: Date, default: Date.now },
+        changedBy: { type: mongoose.Schema.Types.ObjectId, ref: "Admin" },
+        addedSessions: [{ type: mongoose.Schema.Types.ObjectId, ref: "CampSession" }],
+        removedSessions: [{ type: mongoose.Schema.Types.ObjectId, ref: "CampSession" }],
+        previousTotal: Number,
+        newTotal: Number,
+      },
+    ],
   },
   { timestamps: true }
 );

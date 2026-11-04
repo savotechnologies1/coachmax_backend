@@ -4,9 +4,8 @@ uploads/
 coverage/
 .test-tmp/
 
-.env
 
 
-.env.*
 !.env.example
 /config/serviceAccountKey.json
+config.bat

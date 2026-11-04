@@ -10,6 +10,7 @@ const Term = require("../models/Term");
 const Attendance = require("../models/Attendance");
 const Class = require("../models/Class");
 const Team = require("../models/Team");
+const League = require("../models/League");
 const News = require("../models/News");
 const Invoice = require("../models/Invoice");
 const Fixture = require("../models/Fixture");
@@ -845,11 +846,12 @@ const generateClassSessions = (term, classObj) => {
     }
     return sorted;
   }
-  if (!term || !term.startDate || !term.endDate || !classObj) return sessions;
+  const dateRange = term?.startDate && term?.endDate ? term : classObj;
+  if (!dateRange?.startDate || !dateRange?.endDate || !classObj) return sessions;
 
-  const start = new Date(term.startDate);
+  const start = new Date(dateRange.startDate);
   start.setUTCHours(0, 0, 0, 0);
-  const end = new Date(term.endDate);
+  const end = new Date(dateRange.endDate);
   end.setUTCHours(0, 0, 0, 0);
 
   const scheduleType = classObj.scheduleType || "SINGLE_DAY";
@@ -874,6 +876,23 @@ const generateClassSessions = (term, classObj) => {
     return sessions.slice(0, roundLimit);
   }
 
+  return sessions;
+};
+
+const independentTournamentSessions = (team) => {
+  const sessions = [];
+  for (const enrollment of team.leagues || []) {
+    const league = enrollment.league;
+    if (enrollment.status === "WITHDRAWN" || !league || typeof league !== "object" || league.term != null) continue;
+    const sessionDates = enrollment.sessionDates?.length ? enrollment.sessionDates : league.sessionDates || [];
+    sessions.push(...generateClassSessions(null, {
+      ...(team.toObject ? team.toObject() : team),
+      sessionDates,
+      round: enrollment.round ?? league.numberOfRounds,
+      startDate: league.startDate,
+      endDate: league.endDate,
+    }));
+  }
   return sessions;
 };
 
@@ -1240,6 +1259,7 @@ exports.getMyTeams = async (req, res) => {
 
     const teams = await Team.find({ "players.player": playerId })
       .populate("term", "name startDate endDate")
+      .populate("leagues.league", "term startDate endDate sessionDates numberOfRounds")
       .populate("coach", "name email phone")
       .populate("assistantCoach", "name email phone")
       .populate("captain", "fullName email phone profileImage jerseyNumber")
@@ -1366,7 +1386,7 @@ exports.getMyTeams = async (req, res) => {
       // Generate sessions from explicit round dates or term & schedule
       const teamLeagueSessions = (team.leagues && team.leagues.length > 0)
         ? (league
-            ? (team.leagues.find((l) => l.league && l.league.toString() === (league._id || league).toString())?.sessionDates || [])
+            ? (team.leagues.find((l) => l.league && (l.league?._id || l.league).toString() === (league._id || league).toString())?.sessionDates || [])
             : team.leagues.flatMap((l) => l.sessionDates || []))
         : [];
       const explicitDates = (team.sessionDates && team.sessionDates.length > 0)
@@ -1375,7 +1395,8 @@ exports.getMyTeams = async (req, res) => {
       const hasExplicitSessions = explicitDates && explicitDates.length > 0;
       const generatedSessions = hasExplicitSessions
         ? explicitDates.map((d) => new Date(d))
-        : (team.term ? generateClassSessions(team.term, team) : []);
+        : generateClassSessions(team.term, team);
+      generatedSessions.push(...independentTournamentSessions(team));
 
       // Also collect any dates from existing attendance records so they aren't missed (if not explicit)
       const sessionDateMap = new Map();
@@ -1636,6 +1657,7 @@ exports.getMyAttendanceByTeam = async (req, res) => {
         path: "term",
         select: "startDate endDate",
       })
+      .populate("leagues.league", "term startDate endDate sessionDates numberOfRounds")
       .populate({
         path: "players.player",
         select: "firstName lastName fullName profileImage jerseyNumber dob gender rating contactName relationship statistics",
@@ -1701,7 +1723,8 @@ exports.getMyAttendanceByTeam = async (req, res) => {
     const hasExplicitSessions = explicitDates && explicitDates.length > 0;
     const generatedSessions = hasExplicitSessions
       ? explicitDates.map((d) => new Date(d))
-      : (team.term ? generateClassSessions(team.term, team) : []);
+      : generateClassSessions(team.term, team);
+    generatedSessions.push(...independentTournamentSessions(team));
     const attendanceData = await Attendance.find({ team: teamId }).select("sessionDate records");
 
     const sessionDateMap = new Map();
@@ -2175,7 +2198,7 @@ exports.getClasses = async (req, res) => {
 exports.markPlayerAbsent = async (req, res) => {
   try {
     const parentId = req.parent._id;
-    const { playerId, classId, teamId, sessionDate, reason } = req.body;
+    const { playerId, classId, teamId, leagueId, sessionDate, reason } = req.body;
 
     if (!playerId || (!classId && !teamId) || !sessionDate) {
       return res.status(400).json({
@@ -2363,29 +2386,42 @@ exports.markPlayerAbsent = async (req, res) => {
         });
       }
 
-      const isAssigned = (teamDoc.players || []).some(
-        (p) => (p.player?._id || p.player || "").toString() === playerId.toString()
-      );
-      if (!isAssigned) {
-        return res.status(400).json({
-          success: false,
-          message: "Player is not enrolled in this team",
-        });
-      }
-
-      if (teamDoc.term) {
-        const termStart = dateOnlyStartUtc(teamDoc.term.startDate, "term.startDate");
-        const termEnd = dateOnlyEndUtc(teamDoc.term.endDate, "term.endDate");
-
-        if (targetDate < termStart || targetDate > termEnd) {
-          return res.status(400).json({
-            success: false,
-            message: `Session date is outside of Term dates (${teamDoc.term.name})`,
-          });
+      const enrolledLeagueIds = (teamDoc.leagues || [])
+        .filter((entry) => entry.status !== "WITHDRAWN")
+        .map((entry) => entry.league);
+      let attendanceLeague = null;
+      if (leagueId) {
+        if (!mongoose.Types.ObjectId.isValid(leagueId) || !enrolledLeagueIds.some((id) => String(id) === String(leagueId))) {
+          return res.status(400).json({ success: false, message: "Select a tournament this team belongs to" });
         }
+        attendanceLeague = await League.findOne({ _id: leagueId, archivedAt: null }).select("term startDate endDate");
+        if (!attendanceLeague) return res.status(404).json({ success: false, message: "Tournament not found" });
+      } else if (teamDoc.term && (targetDate < dateOnlyStartUtc(teamDoc.term.startDate, "term.startDate") || targetDate > dateOnlyEndUtc(teamDoc.term.endDate, "term.endDate"))) {
+        const independentLeagues = await League.find({
+          _id: { $in: enrolledLeagueIds }, archivedAt: null, term: null,
+          startDate: { $lte: targetDate }, endDate: { $gte: targetDate },
+        }).select("term startDate endDate");
+        if (independentLeagues.length > 1) return res.status(400).json({ success: false, message: "Choose a tournament for this team session" });
+        attendanceLeague = independentLeagues[0] || null;
       }
 
-      if (teamDoc.dayOfWeek) {
+      const selectedEnrollment = attendanceLeague
+        ? (teamDoc.leagues || []).find((entry) => String(entry.league) === String(attendanceLeague._id))
+        : null;
+      const roster = selectedEnrollment?.players?.length ? selectedEnrollment.players : teamDoc.players || [];
+      const isAssigned = roster.some((entry) => entry.status !== "INACTIVE" && String(entry.player?._id || entry.player || entry) === String(playerId));
+      if (!isAssigned) return res.status(400).json({ success: false, message: "Player is not enrolled in this team or tournament" });
+
+      const dateRange = attendanceLeague || teamDoc.term || (teamDoc.startDate && teamDoc.endDate ? teamDoc : null);
+      if (dateRange?.startDate && dateRange?.endDate &&
+        (targetDate < dateOnlyStartUtc(dateRange.startDate, "startDate") || targetDate > dateOnlyEndUtc(dateRange.endDate, "endDate"))) {
+        return res.status(400).json({ success: false, message: `Session date is outside ${attendanceLeague ? "the selected tournament" : teamDoc.term ? `Term dates (${teamDoc.term.name})` : "the team schedule"}` });
+      }
+      if (attendanceLeague?.term && teamDoc.term &&
+        (targetDate < dateOnlyStartUtc(teamDoc.term.startDate, "term.startDate") || targetDate > dateOnlyEndUtc(teamDoc.term.endDate, "term.endDate"))) {
+        return res.status(400).json({ success: false, message: `Session date is outside of Term dates (${teamDoc.term.name})` });
+      }
+      if (teamDoc.dayOfWeek && !attendanceLeague) {
         if (sessionDay !== teamDoc.dayOfWeek.toUpperCase()) {
           return res.status(400).json({
             success: false,
@@ -2396,12 +2432,14 @@ exports.markPlayerAbsent = async (req, res) => {
 
       let attendanceDoc = await Attendance.findOne({
         team: teamId,
+        league: attendanceLeague?._id || null,
         sessionDate: targetDate,
       });
 
       if (!attendanceDoc) {
         attendanceDoc = new Attendance({
           team: teamId,
+          ...(attendanceLeague ? { league: attendanceLeague._id } : {}),
           sessionDate: targetDate,
           records: [],
         });
@@ -2440,6 +2478,7 @@ exports.markPlayerAbsent = async (req, res) => {
           parentId: String(req.parent._id),
           playerId: String(playerId),
           teamId: String(teamId),
+          leagueId: attendanceLeague ? String(attendanceLeague._id) : null,
           sessionDate: formattedDateStr,
           reason: reason.trim(),
         };
@@ -2473,6 +2512,7 @@ exports.markPlayerAbsent = async (req, res) => {
         data: {
           playerId,
           teamId,
+          leagueId: attendanceLeague?._id || null,
           sessionDate: dateOnly(targetDate, "sessionDate"),
           status: "ABSENT",
           reason: reason.trim(),

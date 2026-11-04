@@ -1,4 +1,5 @@
 const Notification = require("../models/Notification");
+const EmailCampaignRecipient = require("../models/EmailCampaignRecipient");
 const { sendNotification } = require("./notificationService");
 const sendEmail = require("../utils/sendEmail");
 const queueNotification = (key, payload, session) => {
@@ -53,16 +54,30 @@ async function processDeliveryJobs({ sendEmailFn = sendEmail, sendNotificationFn
     const notification = result && Object.prototype.hasOwnProperty.call(result, "value") ? result.value : result;
     if (notification) {
       const attempts = notification.deliveryAttempts;
+      const emailPayload = notification.deliveryKind === "EMAIL" ? notification.deliveryPayload || {} : null;
+      if (emailPayload?.campaignRecipientId) {
+        await EmailCampaignRecipient.updateOne({ _id: emailPayload.campaignRecipientId }, { $set: { status: "SENDING", startedAt: new Date(), nextAttemptAt: null }, $inc: { attempts: 1 } }).catch(() => {});
+      }
       try {
         if (notification.deliveryKind === "EMAIL") {
-          const payload = notification.deliveryPayload || {};
-          if (!await sendEmailFn(payload.to, payload.subject, payload.html)) throw new Error("Email was not accepted for delivery");
+          if (!await sendEmailFn(emailPayload.to, emailPayload.subject, emailPayload.html)) throw new Error("Email was not accepted for delivery");
         } else {
           await sendNotificationFn({ ...notification.deliveryPayload, idempotencyKey: notification.idempotencyKey, awaitPush: true });
         }
         await Notification.collection.updateOne({ _id: notification._id, deliveryAttempts: attempts }, { $set: { deliveryStatus: "SENT" }, $unset: { deliveryLockedUntil: 1, deliveryLastError: 1 } });
+        if (emailPayload?.campaignRecipientId) {
+          await EmailCampaignRecipient.updateOne({ _id: emailPayload.campaignRecipientId }, { $set: { status: "SENT", sentAt: new Date(), nextAttemptAt: null, lastError: "" } }).catch(() => {});
+        }
       } catch (error) {
-        await Notification.collection.updateOne({ _id: notification._id, deliveryAttempts: attempts }, { $set: { deliveryStatus: attempts >= 8 ? "FAILED" : "PENDING", deliveryNextAttempt: new Date(Date.now() + Math.min(3600000, 30000 * 2 ** attempts)), deliveryLastError: "Delivery failed" }, $unset: { deliveryLockedUntil: 1 } });
+        const nextAttemptAt = new Date(Date.now() + Math.min(3600000, 30000 * 2 ** attempts));
+        await Notification.collection.updateOne({ _id: notification._id, deliveryAttempts: attempts }, { $set: { deliveryStatus: attempts >= 8 ? "FAILED" : "PENDING", deliveryNextAttempt: nextAttemptAt, deliveryLastError: "Delivery failed" }, $unset: { deliveryLockedUntil: 1 } });
+        if (emailPayload?.campaignRecipientId) {
+          await EmailCampaignRecipient.updateOne({ _id: emailPayload.campaignRecipientId }, { $set: {
+            status: attempts >= 8 ? "FAILED" : "QUEUED",
+            nextAttemptAt: attempts >= 8 ? null : nextAttemptAt,
+            lastError: "Delivery attempt failed.",
+          } }).catch(() => {});
+        }
       }
       continue;
     }

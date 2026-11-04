@@ -3,6 +3,7 @@ const Attendance = require("../models/Attendance");
 const AttendanceHistory = require("../models/AttendanceHistory");
 const Class = require("../models/Class");
 const Team = require("../models/Team");
+const League = require("../models/League");
 const User = require("../models/User");
 const AuditLog = require("../models/AuditLog");
 const { clientIp, deviceInfo } = require("../utils/sessionInfo");
@@ -43,19 +44,30 @@ async function updateAttendance(req, kind, records) {
       if (req.admin.role === "COACH" && ![resource.coach, resource.assistantCoach].some((value) => sid(value) === sid(req.admin._id))) fail("You are not assigned to this resource", 403);
       if (resource.isArchived || resource.status === "INACTIVE") fail("This resource is not active", 409);
       const dateKey = dateOnly(date);
-      if (resource.term?.startDate && (dateKey < dateOnly(resource.term.startDate) || dateKey > dateOnly(resource.term.endDate))) fail("Session date is outside the selected term");
+      let dateRange = resource.term;
+      let dateRangeLabel = "selected term";
       let roster = (resource.players || []).map((value) => sid(kind === "team" ? value.player || value : value));
       if (kind === "team" && leagueId) {
         const enrollment = (resource.leagues || []).find((item) => sid(item.league) === sid(leagueId));
         if (!enrollment || enrollment.status === "WITHDRAWN") fail("Team is not enrolled in the selected league", 409);
+        const league = await League.findOne({ _id: leagueId, archivedAt: null }).select("term startDate endDate").session(session);
+        if (!league) fail("Selected tournament not found", 404);
+        dateRange = league;
+        dateRangeLabel = "selected tournament";
+        if (league.term && resource.term?.startDate && (dateKey < dateOnly(resource.term.startDate) || dateKey > dateOnly(resource.term.endDate))) fail("Session date is outside the selected term");
         if (enrollment.players?.length) roster = enrollment.players.filter((item) => item.status !== "INACTIVE").map((item) => sid(item.player));
+      } else if (kind === "team" && !resource.term) {
+        dateRange = resource.startDate && resource.endDate ? resource : null;
+        dateRangeLabel = "team schedule";
       }
+      if (dateRange?.startDate && dateRange?.endDate && (dateKey < dateOnly(dateRange.startDate) || dateKey > dateOnly(dateRange.endDate))) fail(`Session date is outside the ${dateRangeLabel}`);
       const trials = kind === "class" ? await User.find({ _id: { $in: ids }, temporaryClass: resourceId, temporarySessionDate: { $gte: date, $lte: dateOnlyEndUtc(dateKey) }, playerStatus: "PENDING_APPROVAL" }).select("_id").session(session) : [];
       const allowed = new Set([...roster, ...trials.map((item) => sid(item._id))]);
       if (ids.some((value) => !allowed.has(value))) fail("A player is not enrolled in this resource", 403);
       const filter = { [kind]: resourceId, ...(kind === "team" ? { league: leagueId } : {}), sessionDate: { $gte: date, $lte: dateOnlyEndUtc(dateKey) } };
       let attendance = await Attendance.findOne(filter).session(session);
       if (!attendance) [attendance] = await Attendance.create([{ [kind]: resourceId, ...(kind === "team" ? { league: leagueId } : {}), sessionDate: date, records: [], markedBy: req.admin._id }], { session });
+      if (attendance.sessionStatus === "CANCELLED") fail(`Attendance cannot be changed because this ${kind} session is cancelled`, 409);
       const changes = [];
       for (let i = 0; i < records.length; i++) {
         const previous = attendance.records.find((item) => sid(item.player) === ids[i]);
