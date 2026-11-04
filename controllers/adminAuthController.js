@@ -42,6 +42,7 @@ const {
 } = require("../utils/paymentStatus");
 const { dateOnly, dateOnlyToUtc, serializeTerm, ageGroupContextYear, ageGroupDobRange, parseAgeGroupRange, formatDateOnly, formatTimestamp, dateOnlyStartUtc, dateOnlyEndUtc, todayDateOnly, calendarTimestampRange } = require("../utils/dateTime");
 const { validatedTermData } = require("../utils/termDates");
+const { DAY_MAP, generateDatesForDay: _generateDatesForDay, generateClassSessions } = require("../utils/classSessionDates");
 
 const recordSignInFailure = async (req, account, reason) => {
   const device = deviceInfo(req);
@@ -3064,85 +3065,6 @@ exports.getClassesByTerm = async (req, res) => {
   }
 };
 
-const _generateDatesForDay = (start, end, targetDay) => {
-  const dates = [];
-  let current = new Date(start);
-
-  while (current.getUTCDay() !== targetDay) {
-    current.setUTCDate(current.getUTCDate() + 1);
-  }
-
-  while (current <= end) {
-    dates.push(new Date(current));
-    current.setUTCDate(current.getUTCDate() + 7);
-  }
-
-  return dates;
-};
-
-const DAY_MAP = {
-  SUNDAY: 0,
-  MONDAY: 1,
-  TUESDAY: 2,
-  WEDNESDAY: 3,
-  THURSDAY: 4,
-  FRIDAY: 5,
-  SATURDAY: 6,
-};
-
-const generateClassSessions = (term, classObj) => {
-  const sessions = [];
-  if (classObj && classObj.sessionDates && Array.isArray(classObj.sessionDates) && classObj.sessionDates.length > 0) {
-    let sorted = [...classObj.sessionDates]
-      .map((d) => {
-        const date = new Date(d);
-        date.setUTCHours(0, 0, 0, 0);
-        return date;
-      })
-      .sort((a, b) => a.getTime() - b.getTime());
-
-    const roundLimit = Number(classObj.round || classObj.rounds || classObj.numberOfRounds);
-    if (roundLimit && roundLimit > 0) {
-      sorted = sorted.slice(0, roundLimit);
-    }
-    return sorted;
-  }
-  if (!term || !term.startDate || !term.endDate) return sessions;
-
-  const start = new Date(term.startDate);
-  start.setUTCHours(0, 0, 0, 0);
-  const end = new Date(term.endDate);
-  end.setUTCHours(0, 0, 0, 0);
-
-  const scheduleType = classObj.scheduleType || "SINGLE_DAY";
-  const schedule = classObj.schedule || [];
-
-  if ((scheduleType === "WEEKDAYS" || scheduleType === "CUSTOM") && schedule.length > 0) {
-
-    for (const entry of schedule) {
-      const targetDay = DAY_MAP[(entry.dayOfWeek || "").toUpperCase()];
-      if (targetDay === undefined) continue;
-      const dates = _generateDatesForDay(start, end, targetDay);
-      sessions.push(...dates);
-    }
-
-    sessions.sort((a, b) => a.getTime() - b.getTime());
-  } else {
-    if (!classObj.dayOfWeek) return sessions;
-    const targetDay = DAY_MAP[classObj.dayOfWeek.toUpperCase()];
-    if (targetDay === undefined) return sessions;
-    const dates = _generateDatesForDay(start, end, targetDay);
-    sessions.push(...dates);
-  }
-
-  const roundLimit = Number(classObj?.round || classObj?.rounds || classObj?.numberOfRounds);
-  if (roundLimit && roundLimit > 0) {
-    return sessions.slice(0, roundLimit);
-  }
-
-  return sessions;
-};
-
 const generateClassSessionsEnriched = (term, classObj) => {
   const sessions = [];
   const dayNames = ["SUNDAY", "MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY"];
@@ -3173,11 +3095,12 @@ const generateClassSessionsEnriched = (term, classObj) => {
     return sessions;
   }
 
-  if (!term || !term.startDate || !term.endDate) return sessions;
+  const dateRange = term?.startDate && term?.endDate ? term : classObj;
+  if (!dateRange?.startDate || !dateRange?.endDate) return sessions;
 
-  const start = new Date(term.startDate);
+  const start = new Date(dateRange.startDate);
   start.setUTCHours(0, 0, 0, 0);
-  const end = new Date(term.endDate);
+  const end = new Date(dateRange.endDate);
   end.setUTCHours(0, 0, 0, 0);
 
   const scheduleType = classObj.scheduleType || "SINGLE_DAY";
@@ -4029,14 +3952,23 @@ exports.getClassFullTable = async (req, res) => {
 
     const attendanceData = await Attendance.find({
       class: classId,
-    }).select("sessionDate records");
+    }).select("sessionDate records sessionStatus sessionCancellationReason sessionCancelledAt sessionNote sessionNoteUpdatedAt");
 
     const attendanceMap = {};
+    const sessionDetails = {};
 
     attendanceData.forEach((att) => {
       const date = new Date(att.sessionDate)
         .toISOString()
         .split("T")[0];
+
+      sessionDetails[date] = {
+        status: att.sessionStatus || "SCHEDULED",
+        cancellationReason: att.sessionCancellationReason || "",
+        cancelledAt: att.sessionCancelledAt || null,
+        note: att.sessionNote || "",
+        noteUpdatedAt: att.sessionNoteUpdatedAt || null,
+      };
 
       if (!attendanceMap[date]) attendanceMap[date] = {};
 
@@ -4113,6 +4045,7 @@ exports.getClassFullTable = async (req, res) => {
       broadcastRoomId: broadcastRoom ? broadcastRoom._id : null,
       totalSessions: sessionDates.length,
       sessions: sessionDates,
+      sessionDetails,
       players,
     });
 
@@ -4234,6 +4167,8 @@ const resolveTeamSessionConfig = (team, leagueId) => {
       ...(team.toObject ? team.toObject() : team),
       sessionDates: effectiveSessionDates,
       round: effectiveRound,
+      startDate: selectedLeague?.league?.startDate || team.startDate || null,
+      endDate: selectedLeague?.league?.endDate || team.endDate || null,
     },
   };
 };
@@ -4245,7 +4180,7 @@ exports.getTeamSessions = async (req, res) => {
 
     const teamData = await Team.findById(teamId)
       .populate("term")
-      .populate("leagues.league", "name season fee sessionDates numberOfRounds");
+      .populate("leagues.league", "name season fee sessionDates numberOfRounds startDate endDate term");
 
     if (!teamData) {
       return res.status(404).json({ message: "Team not found" });
@@ -4258,8 +4193,8 @@ exports.getTeamSessions = async (req, res) => {
     }
 
     const { selectedLeague, effectiveRound, sessionConfig } = resolveTeamSessionConfig(teamData, leagueId);
-
-    const enrichedSessions = generateClassSessionsEnriched(targetTerm, sessionConfig);
+    const attendanceTerm = selectedLeague?.league?.term === null ? null : targetTerm;
+    const enrichedSessions = generateClassSessionsEnriched(attendanceTerm, sessionConfig);
 
     const formatted = enrichedSessions.map((s) => ({
       fullDate: s.date,
@@ -4308,7 +4243,7 @@ exports.getTeamFullTable = async (req, res) => {
     const team = await Team.findById(teamId)
       .populate("term")
       .populate("coach", "name")
-      .populate("leagues.league", "name season fee sessionDates numberOfRounds")
+      .populate("leagues.league", "name season fee sessionDates numberOfRounds startDate endDate term")
       .populate({
         path: "players.player",
         select:
@@ -4339,9 +4274,10 @@ exports.getTeamFullTable = async (req, res) => {
     }
 
     const { selectedLeague, effectiveSessionDates, effectiveRound, sessionConfig } = resolveTeamSessionConfig(team, leagueId);
+    const attendanceTerm = selectedLeague?.league?.term === null ? null : targetTerm;
 
     const hasExplicitSessions = effectiveSessionDates && effectiveSessionDates.length > 0;
-    const generatedSessions = generateClassSessions(targetTerm, sessionConfig);
+    const generatedSessions = generateClassSessions(attendanceTerm, sessionConfig);
     const sessionDateSet = new Set(
       generatedSessions.map((d) => new Date(d).toISOString().split("T")[0])
     );
@@ -4350,22 +4286,29 @@ exports.getTeamFullTable = async (req, res) => {
     if (leagueId || selectedLeague?.league) {
       attendanceFilter.league = leagueId || (selectedLeague.league?._id || selectedLeague.league);
     }
-    if (!hasExplicitSessions && targetTerm && targetTerm.startDate && targetTerm.endDate) {
-      const start = new Date(targetTerm.startDate);
+    const attendanceRange = attendanceTerm?.startDate && attendanceTerm?.endDate ? attendanceTerm : sessionConfig;
+    if (!hasExplicitSessions && attendanceRange?.startDate && attendanceRange?.endDate) {
+      const start = new Date(attendanceRange.startDate);
       start.setUTCHours(0, 0, 0, 0);
-      const end = new Date(targetTerm.endDate);
+      const end = new Date(attendanceRange.endDate);
       end.setUTCHours(23, 59, 59, 999);
       attendanceFilter.sessionDate = { $gte: start, $lte: end };
     }
 
-    const attendanceData = await Attendance.find(attendanceFilter).select("sessionDate records league");
+    const attendanceData = await Attendance.find(attendanceFilter).select("sessionDate records league sessionStatus sessionCancellationReason sessionNote");
 
     const attendanceMap = {};
+    const sessionDetails = {};
     attendanceData.forEach((att) => {
       const date = new Date(att.sessionDate).toISOString().split("T")[0];
       if (!hasExplicitSessions) {
         sessionDateSet.add(date);
       }
+      sessionDetails[date] = {
+        status: att.sessionStatus || "SCHEDULED",
+        cancellationReason: att.sessionCancellationReason || "",
+        note: att.sessionNote || "",
+      };
       if (!attendanceMap[date]) attendanceMap[date] = {};
       att.records.forEach((r) => {
         attendanceMap[date][r.player.toString()] = {
@@ -4475,6 +4418,7 @@ exports.getTeamFullTable = async (req, res) => {
       } : null,
       totalSessions: sessionDates.length,
       sessions: sessionDates,
+      sessionDetails,
       players,
     });
   } catch (err) {
@@ -4488,7 +4432,7 @@ exports.exportTeamCSV = async (req, res) => {
 
     const team = await Team.findById(teamId)
       .populate("term")
-      .populate("leagues.league", "name season fee sessionDates numberOfRounds")
+      .populate("leagues.league", "name season fee sessionDates numberOfRounds startDate endDate term")
       .populate({
         path: "players.player",
         select: "fullName email dob phone contactName statistics",
@@ -4509,9 +4453,10 @@ exports.exportTeamCSV = async (req, res) => {
     }
 
     const { selectedLeague, effectiveSessionDates, sessionConfig } = resolveTeamSessionConfig(team, leagueId);
+    const attendanceTerm = selectedLeague?.league?.term === null ? null : targetTerm;
 
     const hasExplicitSessions = effectiveSessionDates && effectiveSessionDates.length > 0;
-    const generatedSessions = generateClassSessions(targetTerm, sessionConfig);
+    const generatedSessions = generateClassSessions(attendanceTerm, sessionConfig);
     const sessionDateSet = new Set(
       generatedSessions.map((d) => new Date(d).toISOString().split("T")[0])
     );
@@ -4520,10 +4465,11 @@ exports.exportTeamCSV = async (req, res) => {
     if (leagueId || selectedLeague?.league) {
       attendanceFilter.league = leagueId || (selectedLeague.league?._id || selectedLeague.league);
     }
-    if (!hasExplicitSessions && targetTerm && targetTerm.startDate && targetTerm.endDate) {
-      const start = new Date(targetTerm.startDate);
+    const attendanceRange = attendanceTerm?.startDate && attendanceTerm?.endDate ? attendanceTerm : sessionConfig;
+    if (!hasExplicitSessions && attendanceRange?.startDate && attendanceRange?.endDate) {
+      const start = new Date(attendanceRange.startDate);
       start.setUTCHours(0, 0, 0, 0);
-      const end = new Date(targetTerm.endDate);
+      const end = new Date(attendanceRange.endDate);
       end.setUTCHours(23, 59, 59, 999);
       attendanceFilter.sessionDate = { $gte: start, $lte: end };
     }
@@ -5891,6 +5837,10 @@ exports.cloneTerm = async (req, res) => {
           delete teamObject.statistics;
 
           teamObject.term = targetTermId;
+          teamObject.termScope = "TERM";
+          teamObject.year = targetTerm.year;
+          teamObject.startDate = null;
+          teamObject.endDate = null;
           teamObject.players = clonedPlayers;
           teamObject.leagues = [];
 
@@ -5923,6 +5873,8 @@ exports.cloneTerm = async (req, res) => {
       delete leagueObject.updatedAt;
 
       leagueObject.term = targetTermId;
+      leagueObject.termScope = "TERM";
+      leagueObject.year = targetTerm.year;
       leagueObject.season = targetTerm.name || sourceLeague.season;
       leagueObject.startDate = targetTerm.startDate || sourceLeague.startDate;
       leagueObject.endDate = targetTerm.endDate || sourceLeague.endDate;

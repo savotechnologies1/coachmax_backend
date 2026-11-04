@@ -14,6 +14,12 @@ const leagueSchema = new mongoose.Schema(
       type: String,
       required: true,
     },
+    year: { type: Number, min: 1000, max: 9999 },
+    termScope: {
+      type: String,
+      enum: ["TERM", "INDEPENDENT"],
+      default: "TERM",
+    },
     logo: {
       type: String,
       default: "",
@@ -32,7 +38,7 @@ const leagueSchema = new mongoose.Schema(
     },
     status: {
       type: String,
-      enum: ["UPCOMING", "ACTIVE", "COMPLETED"],
+      enum: ["UPCOMING", "ACTIVE", "COMPLETED", "DRAFT"],
       default: "ACTIVE",
     },
     type: {
@@ -43,6 +49,7 @@ const leagueSchema = new mongoose.Schema(
     term: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "Term",
+      default: null,
     },
     registrationStartDate: {
       type: Date,
@@ -151,6 +158,8 @@ const leagueSchema = new mongoose.Schema(
 );
 
 leagueSchema.set("toJSON", { transform: (_doc, result) => {
+  result.termScope = result.term ? "TERM" : "INDEPENDENT";
+  result.year ||= result.term?.year || (result.startDate ? new Date(result.startDate).getUTCFullYear() : undefined);
   if (result.startDate) result.startDate = dateOnly(result.startDate);
   if (result.endDate) result.endDate = dateOnly(result.endDate);
   if (result.registrationStartDate) result.registrationStartDate = dateOnly(result.registrationStartDate);
@@ -158,5 +167,11 @@ leagueSchema.set("toJSON", { transform: (_doc, result) => {
   if (result.sessionDates) result.sessionDates = result.sessionDates.map((date) => dateOnly(date));
   return result;
 } });
+leagueSchema.pre("validate", function () {
+  if (this.termScope === "TERM" && !this.term) this.invalidate("term", "An academic term is required for a term-linked tournament.");
+  if (this.termScope === "INDEPENDENT" && this.term) this.invalidate("term", "Independent tournaments cannot have an academic term.");
+  if (this.termScope === "INDEPENDENT" && !this.year) this.invalidate("year", "A year is required for an independent tournament.");
+});
 leagueSchema.index({ term: 1, name: 1 });
+leagueSchema.index({ termScope: 1, year: 1, archivedAt: 1 });
 module.exports = mongoose.model("League", leagueSchema);

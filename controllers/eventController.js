@@ -6,6 +6,7 @@ const RegistrationRequest = require("../models/RegistrationRequest");
 const CampSession = require("../models/CampSession");
 const Attendance = require("../models/Attendance");
 const Invoice = require("../models/Invoice");
+const Payment = require("../models/Payment");
 const Parent = require("../models/Parent");
 const Term = require("../models/Term");
 const { generateInvoiceNumber } = require("./invoiceController");
@@ -68,6 +69,21 @@ async function resolveEventAttendanceScope({ eventId, dateKey, campSessionId }) 
       error.statusCode = 400;
       throw error;
     }
+    if (session.isCancelled) {
+      const error = new Error("Attendance cannot be changed because this event day is cancelled");
+      error.statusCode = 409;
+      throw error;
+    }
+  } else {
+    const daySessions = await CampSession.find({
+      event: eventId,
+      sessionDate: { $gte: dateOnlyStartUtc(dateKey), $lte: dateOnlyEndUtc(dateKey) },
+    }).select("isCancelled");
+    if (daySessions.length > 0 && daySessions.every((item) => item.isCancelled)) {
+      const error = new Error("Attendance cannot be changed because this event day is cancelled");
+      error.statusCode = 409;
+      throw error;
+    }
   }
 
   const registrations = await EventRegistration.find({
@@ -109,6 +125,30 @@ async function resolveEventAttendanceScope({ eventId, dateKey, campSessionId }) 
 
 function eventErrorStatus(error) {
   return Number.isInteger(error?.statusCode) ? error.statusCode : 500;
+}
+
+const campAmountInCents = (amount) => Math.round(Number(amount || 0) * 100);
+
+async function getRegistrationInvoices(registration, session) {
+  const invoiceId = registration.invoice?._id || registration.invoice;
+  const refs = [{ eventRegistration: registration._id }];
+  if (invoiceId) refs.push({ _id: invoiceId });
+  const query = Invoice.find({ $or: refs }).sort({ createdAt: 1 });
+  if (session) query.session(session);
+  return query;
+}
+
+function summarizeRegistrationBilling(registration, invoices) {
+  const paidCents = invoices
+    .filter((invoice) => invoice.paymentStatus === "PAID")
+    .reduce((sum, invoice) => sum + campAmountInCents(invoice.totalAmount), 0);
+  const totalCents = campAmountInCents(registration.totalAmount);
+  return {
+    bookedTotal: totalCents / 100,
+    paidAmount: paidCents / 100,
+    balanceDue: Math.max(0, totalCents - paidCents) / 100,
+    creditAmount: Math.max(0, paidCents - totalCents) / 100,
+  };
 }
 
 async function resolveEventTermId({ requestedTermId, startDate, endDate, eventType }) {
@@ -653,6 +693,7 @@ exports.registerForEvent = async (req, res) => {
         _id: { $in: selectedSessionIds },
         event: eventId,
         isAvailable: true,
+        isCancelled: { $ne: true },
       });
 
       if (dbSessions.length !== selectedSessionIds.length) {
@@ -1568,6 +1609,41 @@ exports.updateCampDayNote = async (req, res) => {
   }
 };
 
+/** Cancel or restore every session on one event calendar date. */
+exports.setCampDayCancellation = async (req, res) => {
+  try {
+    const { eventId } = req.params;
+    const { date, isCancelled = true, reason = "" } = req.body || {};
+    if (!date) return res.status(400).json({ success: false, message: "Date is required" });
+    if (typeof isCancelled !== "boolean") return res.status(400).json({ success: false, message: "isCancelled must be a boolean" });
+    if (typeof reason !== "string") return res.status(400).json({ success: false, message: "Cancellation reason must be a string" });
+    if (reason.length > 1000) return res.status(400).json({ success: false, message: "Cancellation reason cannot exceed 1000 characters" });
+    if (isCancelled && !reason.trim()) return res.status(400).json({ success: false, message: "A cancellation reason is required" });
+
+    const event = await Event.findById(eventId).select("_id");
+    if (!event) return res.status(404).json({ success: false, message: "Event not found" });
+    const dateKey = dateOnly(date, "date");
+    const update = isCancelled
+      ? { isCancelled: true, cancellationReason: reason.trim(), cancelledAt: new Date(), cancelledBy: req.admin?._id || null }
+      : { isCancelled: false, cancellationReason: "", cancelledAt: null, cancelledBy: null };
+    const result = await CampSession.updateMany(
+      { event: eventId, sessionDate: { $gte: dateOnlyStartUtc(dateKey), $lte: dateOnlyEndUtc(dateKey) } },
+      { $set: update }
+    );
+    if (!result.matchedCount) return res.status(404).json({ success: false, message: "No camp sessions found for this date" });
+
+    const sessions = await CampSession.find({ event: eventId, sessionDate: { $gte: dateOnlyStartUtc(dateKey), $lte: dateOnlyEndUtc(dateKey) } }).sort({ sessionType: 1 });
+    return res.json({
+      success: true,
+      message: isCancelled ? `Event day ${dateKey} cancelled` : `Event day ${dateKey} restored`,
+      data: sessions.map(serializeCampSession),
+    });
+  } catch (error) {
+    console.error("setCampDayCancellation error:", error);
+    return res.status(eventErrorStatus(error)).json({ success: false, message: error.message });
+  }
+};
+
 /**
  * Get full attendance grid for an event (matching the screenshot)
  * Columns: Configured camp dates & sessions
@@ -1577,6 +1653,11 @@ exports.updateCampDayNote = async (req, res) => {
 exports.getEventAttendanceGrid = async (req, res) => {
   try {
     const { eventId } = req.params;
+    const selectedDate = req.query.selectedDate;
+    if (selectedDate !== undefined && !isDateOnly(selectedDate)) {
+      return res.status(400).json({ success: false, message: "selectedDate must be a valid YYYY-MM-DD date" });
+    }
+    const selectedDateKey = selectedDate === undefined ? null : selectedDate.trim();
 
     const event = await Event.findById(eventId);
     if (!event || event.isArchived) {
@@ -1585,6 +1666,11 @@ exports.getEventAttendanceGrid = async (req, res) => {
 
     // 1. Fetch all configured camp sessions
     const sessions = await CampSession.find({ event: eventId }).sort({ sessionDate: 1, sessionType: 1 });
+    if (selectedDateKey && !sessions.some(
+      (session) => dateOnly(session.sessionDate, "sessionDate") === selectedDateKey
+    )) {
+      return res.status(400).json({ success: false, message: "selectedDate is not a configured event day" });
+    }
 
     // 2. Fetch all registered players for this event
     const registrations = await EventRegistration.find({
@@ -1648,7 +1734,14 @@ exports.getEventAttendanceGrid = async (req, res) => {
       sessions.forEach((sess) => {
         const dStr = dateOnly(sess.sessionDate, "sessionDate");
         const isRegisteredForSession = playerSelectedSessions.some(
-          (pss) => pss.session && pss.session.toString() === sess._id.toString()
+          (pss) => {
+            if (pss.session) return pss.session.toString() === sess._id.toString();
+            // Older selected-session records may contain a date and type but
+            // no session ID. Match those to the configured session for that day.
+            return pss.sessionDate
+              && dateOnly(pss.sessionDate, "selectedSession.sessionDate") === dStr
+              && (!pss.sessionType || pss.sessionType === sess.sessionType);
+          }
         ) || (playerSelectedSessions.length === 0); // If no session array, registered for event
 
         const sessId = sess._id.toString();
@@ -1716,6 +1809,8 @@ exports.getEventAttendanceGrid = async (req, res) => {
         sessionType: sess.sessionType,
         sessionLabel: sess.sessionLabel || (sess.sessionType === "HALF_DAY" ? "Half Day" : "Full Day"),
         dayNote: sess.dayNote || "",
+        isCancelled: Boolean(sess.isCancelled),
+        cancellationReason: sess.cancellationReason || "",
         startTime: sess.startTime,
         endTime: sess.endTime,
         fee: sess.fee,
@@ -1725,6 +1820,19 @@ exports.getEventAttendanceGrid = async (req, res) => {
         absentCount,
       };
     });
+
+    // Keep summaries and event totals based on the complete roster. The day
+    // filter changes only the player rows returned to the attendance grid.
+    const selectedDaySessionIds = selectedDateKey
+      ? sessions
+        .filter((session) => dateOnly(session.sessionDate, "sessionDate") === selectedDateKey)
+        .map((session) => session._id.toString())
+      : [];
+    const visiblePlayers = selectedDateKey
+      ? players.filter((player) => selectedDaySessionIds.some(
+        (sessionId) => player.attendance[sessionId]?.isRegistered
+      ))
+      : players;
 
     res.json({
       success: true,
@@ -1743,7 +1851,9 @@ exports.getEventAttendanceGrid = async (req, res) => {
         },
         sessions: sessions.map(serializeCampSession),
         sessionSummaries,
-        players,
+        selectedDate: selectedDateKey,
+        selectedDayRegistered: selectedDateKey ? visiblePlayers.length : null,
+        players: visiblePlayers.map((player, index) => ({ ...player, rowNumber: index + 1 })),
       },
     });
   } catch (error) {
@@ -2013,15 +2123,254 @@ exports.getEventRegistrationDetails = async (req, res) => {
       };
     });
 
+    const invoices = await getRegistrationInvoices(registration);
+
     res.json({
       success: true,
       data: {
         registration: serializeRegistration(registration),
         attendanceHistory,
+        billingSummary: summarizeRegistrationBilling(registration, invoices),
+        invoices: invoices.map((invoice) => ({
+          _id: invoice._id,
+          invoiceNumber: invoice.invoiceNumber,
+          totalAmount: invoice.totalAmount,
+          paymentStatus: invoice.paymentStatus,
+          status: invoice.status,
+        })),
       },
     });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+/** Replace one holiday-camp player's booked sessions and reconcile the unpaid balance. */
+exports.updateEventRegistrationSessions = async (req, res) => {
+  const { registrationId } = req.params;
+  const selectedSessionIds = req.body?.selectedSessionIds;
+  if (!mongoose.Types.ObjectId.isValid(registrationId)) {
+    return res.status(400).json({ success: false, message: "A valid registration ID is required" });
+  }
+  if (!Array.isArray(selectedSessionIds) || selectedSessionIds.length === 0 ||
+      selectedSessionIds.some((id) => typeof id !== "string" || !mongoose.Types.ObjectId.isValid(id)) ||
+      new Set(selectedSessionIds).size !== selectedSessionIds.length) {
+    return res.status(400).json({ success: false, message: "Select at least one unique, valid camp session" });
+  }
+
+  const fail = (statusCode, message) => {
+    const error = new Error(message);
+    error.statusCode = statusCode;
+    throw error;
+  };
+  const transaction = await mongoose.startSession();
+  let result;
+  try {
+    await transaction.withTransaction(async () => {
+      const registration = await EventRegistration.findById(registrationId).session(transaction);
+      if (!registration) fail(404, "Registration not found");
+      if (registration.status !== "REGISTERED") fail(409, "This player is no longer registered for the event");
+
+      const event = await Event.findById(registration.event).session(transaction);
+      if (!event || event.isArchived) fail(404, "Event not found");
+      const isCamp = ["CAMP", "HOLIDAY CAMP"].includes(String(event.eventType || "").toUpperCase()) ||
+        String(event.category || "").toLowerCase().includes("camp");
+      if (!isCamp) fail(400, "Session editing is available only for holiday camps");
+
+      const original = registration.selectedSessions || [];
+      if (original.length === 0 || original.some((item) => !item.session)) {
+        fail(409, "This legacy registration has no editable session references. Contact support to reconcile it.");
+      }
+      const oldIds = new Set(original.map((item) => String(item.session)));
+      const requestedIds = new Set(selectedSessionIds);
+      const addedIds = selectedSessionIds.filter((id) => !oldIds.has(id));
+      const removedIds = [...oldIds].filter((id) => !requestedIds.has(id));
+      if (addedIds.length === 0 && removedIds.length === 0) {
+        const invoices = await getRegistrationInvoices(registration, transaction);
+        result = {
+          registration: serializeRegistration(registration),
+          billingSummary: summarizeRegistrationBilling(registration, invoices),
+          addedSessions: 0,
+          removedSessions: 0,
+        };
+        return;
+      }
+
+      const sessions = await CampSession.find({ event: event._id, _id: { $in: selectedSessionIds } }).session(transaction);
+      if (sessions.length !== selectedSessionIds.length) fail(400, "One or more camp sessions do not belong to this event");
+      const byId = new Map(sessions.map((item) => [String(item._id), item]));
+      const originalById = new Map(original.map((item) => [String(item.session), item]));
+      const eventStart = dateOnly(event.startDate, "event.startDate");
+      const eventEnd = dateOnly(event.endDate, "event.endDate");
+      const dates = new Set();
+      const selected = [];
+      for (const id of selectedSessionIds) {
+        const campSession = byId.get(id);
+        const dateKey = dateOnly(campSession.sessionDate, "sessionDate");
+        if (dateKey < eventStart || dateKey > eventEnd) fail(400, "A selected session is outside the event dates");
+        if (dates.has(dateKey)) fail(400, `Choose only one session on ${formatDateOnly(dateKey)}`);
+        dates.add(dateKey);
+        if (!oldIds.has(id)) {
+          if (!campSession.isAvailable || campSession.isCancelled) {
+            fail(409, `The session on ${formatDateOnly(dateKey)} is unavailable`);
+          }
+          if (campSession.capacity !== null && campSession.capacity !== undefined) {
+            const occupied = await EventRegistration.countDocuments({
+              event: event._id,
+              status: "REGISTERED",
+              "selectedSessions.session": campSession._id,
+            }).session(transaction);
+            if (occupied >= campSession.capacity) fail(409, `The session on ${formatDateOnly(dateKey)} is full`);
+          }
+        }
+        const previous = originalById.get(id);
+        selected.push({
+          session: campSession._id,
+          sessionDate: dateOnlyToUtc(dateKey, "sessionDate"),
+          sessionType: previous?.sessionType || campSession.sessionType,
+          fee: oldIds.has(id) ? Number(previous?.fee || 0) : Number(campSession.fee || 0),
+          startTime: previous?.startTime || campSession.startTime,
+          endTime: previous?.endTime || campSession.endTime,
+        });
+      }
+      selected.sort((left, right) =>
+        dateOnly(left.sessionDate, "sessionDate").localeCompare(dateOnly(right.sessionDate, "sessionDate"))
+      );
+
+      for (const id of removedIds) {
+        const previous = originalById.get(id);
+        const dateKey = dateOnly(previous.sessionDate, "selectedSession.sessionDate");
+        const markedAttendance = await Attendance.exists({
+          event: event._id,
+          $or: [
+            { campSession: id },
+            { campSession: null, sessionDate: { $gte: dateOnlyStartUtc(dateKey), $lte: dateOnlyEndUtc(dateKey) } },
+          ],
+          records: { $elemMatch: { player: registration.user, status: { $in: ["PRESENT", "ABSENT", "LATE"] } } },
+        }).session(transaction);
+        if (markedAttendance) fail(409, `Attendance is already marked on ${formatDateOnly(dateKey)}. Clear it before removing this session.`);
+      }
+
+      const newTotalCents = selected.reduce((sum, item) => sum + campAmountInCents(item.fee), 0);
+      const oldTotal = Number(registration.totalAmount || 0);
+      const invoices = await getRegistrationInvoices(registration, transaction);
+      const paidInvoices = invoices.filter((invoice) => invoice.paymentStatus === "PAID");
+      const paidCents = paidInvoices.reduce((sum, invoice) => sum + campAmountInCents(invoice.totalAmount), 0);
+      const amountDue = Math.max(0, newTotalCents - paidCents) / 100;
+      const activeUnpaid = invoices.filter((invoice) => invoice.status === "ACTIVE" && invoice.paymentStatus !== "PAID");
+      if (activeUnpaid.some((invoice) => invoice.paymentStatus === "PAYMENT_PENDING")) {
+        fail(409, "A payment is pending for this registration. Resolve it before changing sessions.");
+      }
+      if (activeUnpaid.length > 0) {
+        const pendingPayment = await Payment.exists({ invoice: { $in: activeUnpaid.map((invoice) => invoice._id) }, status: { $in: ["PENDING", "APPROVED"] } }).session(transaction);
+        if (pendingPayment) fail(409, "A payment submission exists for this registration. Resolve it before changing sessions.");
+      }
+
+      registration.selectedSessions = selected;
+      registration.totalAmount = newTotalCents / 100;
+      registration.sessionChangeHistory.push({
+        changedAt: new Date(),
+        changedBy: req.admin?._id,
+        addedSessions: addedIds,
+        removedSessions: removedIds,
+        previousTotal: oldTotal,
+        newTotal: registration.totalAmount,
+      });
+
+      let currentInvoice = activeUnpaid[0] || null;
+      if (amountDue > 0) {
+        const items = paidCents === 0
+          ? selected.map((item) => ({
+            title: `Holiday Camp: ${formatDateOnly(dateOnly(item.sessionDate, "sessionDate"))} (${item.sessionType})`,
+            description: `Time: ${item.startTime} - ${item.endTime}`,
+            amount: Number(item.fee || 0),
+          }))
+          : [{
+            title: `Holiday Camp booking balance: ${event.title}`,
+            description: `${selected.length} sessions; $${(paidCents / 100).toFixed(2)} already paid`,
+            amount: amountDue,
+          }];
+        if (currentInvoice) {
+          currentInvoice.items = items;
+          currentInvoice.subtotal = amountDue;
+          currentInvoice.discount = 0;
+          currentInvoice.totalAmount = amountDue;
+          currentInvoice.amount = amountDue;
+          currentInvoice.paymentStatus = "UNPAID";
+          currentInvoice.eventRegistration = registration._id;
+          await currentInvoice.save({ session: transaction });
+        } else {
+          const player = await User.findById(registration.user).select("parentId fullName").session(transaction);
+          const parentId = paidInvoices.at(-1)?.parent || player?.parentId;
+          if (!parentId) fail(409, "A parent or guardian must be linked to this player before an additional invoice can be created");
+          const dueDate = new Date();
+          dueDate.setDate(dueDate.getDate() + 7);
+          currentInvoice = new Invoice({
+            invoiceNumber: await generateInvoiceNumber({ session: transaction }),
+            parent: parentId,
+            players: [registration.user],
+            items,
+            subtotal: amountDue,
+            discount: 0,
+            totalAmount: amountDue,
+            amount: amountDue,
+            dueDate,
+            type: "CAMP_FEE",
+            description: `${event.title} registration balance`,
+            paymentMethod: "ONLINE",
+            paymentStatus: "UNPAID",
+            status: "ACTIVE",
+            event: event._id,
+            eventRegistration: registration._id,
+          });
+          await currentInvoice.save({ session: transaction });
+        }
+        for (const extra of activeUnpaid.slice(1)) {
+          extra.status = "CANCELLED";
+          extra.paymentStatus = "CANCELLED";
+          await extra.save({ session: transaction });
+        }
+        registration.invoice = currentInvoice._id;
+        if (registration.paymentStatus === "PAID") registration.paymentStatus = "UNPAID";
+      } else {
+        for (const unpaid of activeUnpaid) {
+          unpaid.status = "CANCELLED";
+          unpaid.paymentStatus = "CANCELLED";
+          await unpaid.save({ session: transaction });
+        }
+        registration.invoice = paidInvoices.at(-1)?._id || undefined;
+        registration.paymentStatus = "PAID";
+      }
+      await registration.save({ session: transaction });
+
+      for (const id of [...new Set([...addedIds, ...removedIds])]) {
+        const registeredCount = await EventRegistration.countDocuments({
+          event: event._id,
+          status: "REGISTERED",
+          "selectedSessions.session": id,
+        }).session(transaction);
+        await CampSession.updateOne({ _id: id, event: event._id }, { $set: { registeredCount } }, { session: transaction });
+      }
+
+      result = {
+        registration: serializeRegistration(registration),
+        billingSummary: {
+          bookedTotal: registration.totalAmount,
+          paidAmount: paidCents / 100,
+          balanceDue: amountDue,
+          creditAmount: Math.max(0, paidCents - newTotalCents) / 100,
+        },
+        addedSessions: addedIds.length,
+        removedSessions: removedIds.length,
+      };
+    });
+
+    return res.json({ success: true, message: "Camp sessions updated. Paid invoices remain unchanged; any credit requires separate handling.", data: result });
+  } catch (error) {
+    console.error("updateEventRegistrationSessions error:", error);
+    return res.status(eventErrorStatus(error)).json({ success: false, message: error.message });
+  } finally {
+    await transaction.endSession();
   }
 };
 
@@ -2048,15 +2397,17 @@ exports.updateEventRegistrationPaymentStatus = async (req, res) => {
       return res.status(404).json({ success: false, message: "Registration not found" });
     }
 
+    const linkedInvoice = registration.invoice ? await Invoice.findById(registration.invoice) : null;
+    if (linkedInvoice?.paymentStatus === "PAID" && paymentStatus !== "PAID") {
+      return res.status(409).json({ success: false, message: "A paid invoice cannot be changed here. Handle payment corrections separately." });
+    }
+    if (linkedInvoice) {
+      const invoiceStatus = paymentStatus === "PAID" ? "PAID" : "UNPAID";
+      linkedInvoice.paymentStatus = invoiceStatus;
+      await linkedInvoice.save();
+    }
     registration.paymentStatus = paymentStatus;
     await registration.save();
-
-    if (registration.invoice) {
-      const invoiceStatus = paymentStatus === "PAID" ? "PAID" : "UNPAID";
-      await Invoice.findByIdAndUpdate(registration.invoice, {
-        paymentStatus: invoiceStatus,
-      });
-    }
 
     res.json({
       success: true,

@@ -83,6 +83,15 @@ const {
   saveAdminFcmToken,
   sendAdminCustomNotification,
 } = require("../controllers/notificationController");
+const {
+  getEmailAudiences,
+  getEmailAudiencePlayers,
+  previewEmailCampaign,
+  createEmailCampaign,
+  getEmailCampaigns,
+  getEmailCampaignDetails,
+  retryFailedEmailRecipients,
+} = require("../controllers/emailCampaignController");
 
 const {
   createAssessment,
@@ -101,6 +110,7 @@ const {
   createLeague,
   createTeam,
   assignPlayerToTeam,
+  updateExternalTeamPlayers,
   createFixture,
   recordMatchEvent,
   completeMatch,
@@ -195,6 +205,7 @@ const {
 const auth = require("../middleware/authMiddleware");
 const isAdmin = require("../middleware/isAdmin");
 const { requireStaff, requireClassAccess, requireTeamAccess, requireEventAccess, requirePlayerAccess, requireTrainingAccess } = require("../middleware/staffAccess");
+const { updateClassSessionDay, updateTeamSessionDay } = require("../controllers/classSessionController");
 const { uploads } = require("../utils/upload");
 const {
   createEvent,
@@ -209,10 +220,12 @@ const {
   configureCampSessions,
   toggleCampDateAvailability,
   updateCampDayNote,
+  setCampDayCancellation,
   getEventAttendanceGrid,
   markEventSingleAttendance,
   markEventBulkAttendance,
   getEventRegistrationDetails,
+  updateEventRegistrationSessions,
   updateEventRegistrationPaymentStatus,
 } = require("../controllers/eventController");
 
@@ -282,6 +295,7 @@ router.get("/getEventDetails/:eventId", auth, requireEventAccess, getEventDetail
 router.post("/events/:eventId/sessions", auth, isAdmin, configureCampSessions);
 router.patch("/events/:eventId/toggle-date", auth, isAdmin, toggleCampDateAvailability);
 router.patch("/events/:eventId/day-note", auth, isAdmin, updateCampDayNote);
+router.patch("/events/:eventId/cancel-day", auth, isAdmin, setCampDayCancellation);
 router.post("/events/:eventId/chat/day", auth, isAdmin, sendEventDayBroadcast);
 router.get("/events/:eventId/chat/day/preview", auth, isAdmin, previewEventDayBroadcast);
 
@@ -290,6 +304,7 @@ router.get("/events/:eventId/attendance-grid", auth, requireEventAccess, getEven
 router.post("/events/:eventId/attendance/single", auth, requireEventAccess, markEventSingleAttendance);
 router.post("/events/:eventId/attendance/bulk", auth, requireEventAccess, markEventBulkAttendance);
 router.get("/events/registrations/:registrationId", auth, isAdmin, getEventRegistrationDetails);
+router.patch("/events/registrations/:registrationId/sessions", auth, isAdmin, updateEventRegistrationSessions);
 router.delete("/events/registrations/:registrationId", auth, isAdmin, removeEventRegistration);
 router.patch("/events/registrations/:registrationId/payment-status", auth, isAdmin, updateEventRegistrationPaymentStatus);
 router.put("/events/registrations/:registrationId/payment-status", auth, isAdmin, updateEventRegistrationPaymentStatus);
@@ -332,6 +347,8 @@ router.get("/getCurrentYearTerms", auth, isAdmin, getCurrentYearTerms);
 router.get("/getClassesByTerm/:termId", auth, isAdmin, getClassesByTerm);
 
 // Class roster and attendance rolls
+router.post("/attendance/:classId/day-action", auth, requireClassAccess, updateClassSessionDay);
+router.post("/team-attendance/:teamId/day-action", auth, requireTeamAccess, updateTeamSessionDay);
 router.post("/markAttendance/:classId", auth, requireClassAccess, markAttendance);
 router.post("/markSingleAttendance/:classId", auth, requireClassAccess, markSingleAttendance);
 router.get("/getAttendanceByClass/:classId", auth, requireClassAccess, getAttendanceByClass);
@@ -401,6 +418,7 @@ router.get("/teams/:teamId/players/:playerId/statistics", auth, isAdmin, getTeam
 router.put("/teams/:teamId/players/:playerId/statistics", auth, isAdmin, updateTeamPlayerStatistics);
 router.delete("/teams/:teamId", auth, isAdmin, deleteTeam);
 router.post("/teams/:teamId/assign", auth, isAdmin, assignPlayerToTeam);
+router.put("/teams/:teamId/external-players", auth, isAdmin, updateExternalTeamPlayers);
 router.post("/teams/:teamId/unassign", auth, isAdmin, unassignPlayerFromTeam);
 router.post("/teams/:teamId/chat/broadcast", auth, isAdmin, sendTeamBroadcast);
 router.post("/teams/:teamId/temporary-players", auth, isAdmin, uploads.array("profileImages", 20), createTeamTemporaryPlayers);
@@ -529,6 +547,15 @@ router.get("/audit-logs/:entityType/:entityId", auth, isAdmin, getEntityAuditLog
 
 //  Coach-Parent Conversations (Admin safeguarding)
 router.get("/chat/conversations", auth, isAdmin, getAllConversations);
+
+// Bulk email campaigns and per-recipient delivery history (Admin dashboard).
+router.get("/email-campaigns/audiences", auth, isAdmin, getEmailAudiences);
+router.get("/email-campaigns/recipients", auth, isAdmin, getEmailAudiencePlayers);
+router.post("/email-campaigns/preview", auth, isAdmin, previewEmailCampaign);
+router.post("/email-campaigns", auth, isAdmin, createEmailCampaign);
+router.get("/email-campaigns", auth, isAdmin, getEmailCampaigns);
+router.get("/email-campaigns/:campaignId", auth, isAdmin, getEmailCampaignDetails);
+router.post("/email-campaigns/:campaignId/retry-failed", auth, isAdmin, retryFailedEmailRecipients);
 
 //  Chat Deletion (Admin only)
 

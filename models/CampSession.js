@@ -32,6 +32,24 @@ const campSessionSchema = new mongoose.Schema(
       default: "",
       maxlength: 2000,
     },
+    isCancelled: {
+      type: Boolean,
+      default: false,
+    },
+    cancellationReason: {
+      type: String,
+      default: "",
+      maxlength: 1000,
+    },
+    cancelledAt: {
+      type: Date,
+      default: null,
+    },
+    cancelledBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Admin",
+      default: null,
+    },
     startTime: {
       type: String,
       required: true,

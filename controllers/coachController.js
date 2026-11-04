@@ -38,12 +38,13 @@ const generateClassSessions = (term, classObj) => {
       })
       .sort((a, b) => a.getTime() - b.getTime());
   }
-  if (!term || !term.startDate || !term.endDate || !classObj) {
+  const dateRange = term?.startDate && term?.endDate ? term : classObj;
+  if (!dateRange?.startDate || !dateRange?.endDate || !classObj) {
     return sessions;
   }
 
-  const start = dateOnlyStartUtc(term.startDate, "term.startDate");
-  const end = dateOnlyEndUtc(term.endDate, "term.endDate");
+  const start = dateOnlyStartUtc(dateRange.startDate, "schedule.startDate");
+  const end = dateOnlyEndUtc(dateRange.endDate, "schedule.endDate");
 
   const scheduleType = classObj.scheduleType || "SINGLE_DAY";
   const schedule = classObj.schedule || [];

@@ -11,6 +11,12 @@ const teamSchema = new mongoose.Schema(
     },
     normalizedName: { type: String, required: true },
     archivedAt: { type: Date, default: null },
+    year: { type: Number, min: 1000, max: 9999 },
+    termScope: {
+      type: String,
+      enum: ["TERM", "INDEPENDENT"],
+      default: "TERM",
+    },
     logo: {
       type: String,
       default: "",
@@ -57,6 +63,15 @@ const teamSchema = new mongoose.Schema(
         },
       },
     ],
+    // Rival roster information is kept on the external team only. These entries
+    // are not User records and must never flow through academy player assignment.
+    externalPlayers: [
+      {
+        name: { type: String, required: true, trim: true, maxlength: 100 },
+        jerseyNumber: { type: String, required: true, trim: true, maxlength: 10 },
+        user: { type: String, trim: true, maxlength: 100, default: "" },
+      },
+    ],
     teamType: {
       type: String,
       enum: ["INTERNAL", "EXTERNAL"],
@@ -65,8 +80,10 @@ const teamSchema = new mongoose.Schema(
     term: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "Term",
-      required: true,
+      default: null,
     },
+    startDate: { type: Date, default: null },
+    endDate: { type: Date, default: null },
     dayOfWeek: {
       type: String,
     },
@@ -169,11 +186,24 @@ const teamSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-teamSchema.pre("validate", function () { this.normalizedName = normalizeTeamName(this.teamName); });
+teamSchema.pre("validate", function () {
+  this.normalizedName = normalizeTeamName(this.teamName);
+  if (this.termScope === "TERM" && !this.term) this.invalidate("term", "An academic term is required for a term-linked team.");
+  if (this.termScope === "INDEPENDENT" && this.term) this.invalidate("term", "Independent teams cannot have an academic term.");
+  if (this.termScope === "INDEPENDENT" && !this.year) this.invalidate("year", "A year is required for an independent team.");
+  if ((this.startDate && !this.endDate) || (!this.startDate && this.endDate)) this.invalidate("endDate", "Provide team start and end dates together.");
+  if (this.startDate && this.endDate && this.endDate < this.startDate) this.invalidate("endDate", "Team end date cannot be earlier than start date.");
+});
 teamSchema.index({ term: 1, normalizedName: 1 }, { unique: true, name: "team_term_normalized_name", partialFilterExpression: { normalizedName: { $type: "string" }, term: { $type: "objectId" } } });
+teamSchema.index({ year: 1, normalizedName: 1 }, { unique: true, name: "team_independent_year_normalized_name", partialFilterExpression: { termScope: "INDEPENDENT", year: { $type: "number" }, normalizedName: { $type: "string" } } });
+teamSchema.index({ termScope: 1, year: 1, archivedAt: 1 });
 teamSchema.index({ "leagues.league": 1 });
 
 teamSchema.set("toJSON", { transform: (_doc, result) => {
+  result.termScope = result.term ? "TERM" : "INDEPENDENT";
+  result.year ||= result.term?.year || (result.startDate ? new Date(result.startDate).getUTCFullYear() : undefined);
+  if (result.startDate) result.startDate = dateOnly(result.startDate);
+  if (result.endDate) result.endDate = dateOnly(result.endDate);
   if (result.sessionDates) result.sessionDates = result.sessionDates.map((date) => dateOnly(date));
   return result;
 } });

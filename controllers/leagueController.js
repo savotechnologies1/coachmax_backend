@@ -35,6 +35,25 @@ const {
 
 const activeLeagueGenerationLocks = new Set();
 
+const parseAcademicYear = (value, fallback) => {
+  const year = Number(value === "" || value === null || value === undefined ? fallback : value);
+  if (!Number.isInteger(year) || year < 1000 || year > 9999) throw domainError("Select a valid four-digit year.");
+  return year;
+};
+
+const resolveAcademicScope = async (body, fallbackScope = "TERM") => {
+  const termScope = String(body.termScope || fallbackScope).toUpperCase();
+  if (!["TERM", "INDEPENDENT"].includes(termScope)) throw domainError("Choose a valid tournament or team term scope.");
+  if (termScope === "INDEPENDENT") {
+    if (body.term) throw domainError("Independent tournaments and teams cannot have an academic term.");
+    return { termScope, termDoc: null };
+  }
+  if (!mongoose.Types.ObjectId.isValid(body.term)) throw domainError("Select a valid academic term.");
+  const termDoc = await Term.findById(body.term);
+  if (!termDoc) throw domainError("Select a valid academic term.");
+  return { termScope, termDoc };
+};
+
 exports.updateLeagueTeamStatus = async (req, res) => {
   try {
     const { leagueId, teamId } = req.params;
@@ -144,6 +163,7 @@ exports.createLeague = async (req, res) => {
       teams,
       venue,
       term,
+      termScope: requestedTermScope,
       // Generation mode
       generationType,
       // Tournament & Scheduling configuration
@@ -375,21 +395,24 @@ exports.createLeague = async (req, res) => {
       };
     }
 
-    if (!mongoose.Types.ObjectId.isValid(term) || !await Term.exists({ _id: term })) throw domainError("Select a valid term for this league.");
+    const { termScope, termDoc } = await resolveAcademicScope({ term, termScope: requestedTermScope });
+    const year = termDoc?.year || parseAcademicYear(req.body.year, norm.startDate.getUTCFullYear());
     const scopeTeams = await Team.find({ _id: { $in: verifiedTeamIds } });
-    assertTeamLeagueScope({ term }, scopeTeams, false);
+    assertTeamLeagueScope({ term: termDoc?._id || null }, scopeTeams, false);
     const rawType = (type || leagueType || competitionScope || "").toUpperCase();
     const VALID_TYPES = ["INTERNATIONAL", "NATIONAL", "STATE", "LOCAL", "OTHERS"];
     const parsedType = VALID_TYPES.includes(rawType) ? rawType : "LOCAL";
 
     const parsedStatus =
-      status && ["UPCOMING", "ACTIVE", "COMPLETED"].includes(status.toUpperCase())
+      status && ["UPCOMING", "ACTIVE", "COMPLETED", "DRAFT"].includes(status.toUpperCase())
         ? status.toUpperCase()
         : "ACTIVE";
 
-    const parsedVisibility =
-      visibility && ["PUBLIC", "PRIVATE"].includes(visibility.toUpperCase())
-        ? visibility.toUpperCase()
+    const rawVisibility = String(visibility || "").toUpperCase();
+    const parsedVisibility = rawVisibility === "INTERNAL"
+      ? "PRIVATE"
+      : ["PUBLIC", "PRIVATE"].includes(rawVisibility)
+        ? rawVisibility
         : "PUBLIC";
 
     const logo = req.file ? `/uploads/leaguelogos/${req.file.filename}` : "";
@@ -412,6 +435,8 @@ exports.createLeague = async (req, res) => {
         {
           name: name.trim(),
           season: season.trim(),
+          year,
+          termScope,
           logo,
           description: description || "",
           startDate: norm.startDate,
@@ -422,7 +447,7 @@ exports.createLeague = async (req, res) => {
           // registrationEndDate: registrationEndDate
           //   ? parseDateToMidnight(registrationEndDate)
           //   : null,
-          term,
+          term: termDoc?._id || null,
           status: parsedStatus,
           type: parsedType,
           visibility: parsedVisibility,
@@ -671,6 +696,7 @@ exports.cloneLeague = async (req, res) => {
       status,
       type,
       term,
+      termScope: requestedTermScope,
       fee,
       numberOfRounds,
       groupCount,
@@ -695,15 +721,18 @@ exports.cloneLeague = async (req, res) => {
     const newStartDate = parseDateToMidnight(startDate || sourceLeague.startDate);
     const newEndDate = parseDateToMidnight(endDate || sourceLeague.endDate);
     if (!newStartDate || !newEndDate || newEndDate < newStartDate) throw domainError("Valid ordered league dates are required.");
-    const targetTerm = term || sourceLeague.term;
-    if (!mongoose.Types.ObjectId.isValid(entityId(targetTerm)) || !await Term.exists({ _id: targetTerm })) throw domainError("Select a valid target term.");
+    const targetScope = requestedTermScope || (term !== undefined ? term ? "TERM" : "INDEPENDENT" : sourceLeague.term ? "TERM" : "INDEPENDENT");
+    const targetTermInput = term !== undefined ? term : String(targetScope).toUpperCase() === "INDEPENDENT" ? null : sourceLeague.term;
+    const { termScope, termDoc } = await resolveAcademicScope({ termScope: targetScope, term: targetTermInput });
+    const targetTerm = termDoc?._id || null;
+    const year = termDoc?.year || parseAcademicYear(req.body.year, newStartDate.getUTCFullYear());
     const newFee = fee !== undefined && fee !== null && !isNaN(Number(fee)) ? Number(fee) : (sourceLeague.fee || 0);
 
     const sourceTeams = (sourceLeague.teams || []).filter((t) => t && t._id);
     let assignedTeamIds = [];
     let newGroups = [];
 
-    const shouldDuplicateTeams = duplicateTeams === true || duplicateTeams === "true" || entityId(targetTerm) !== entityId(sourceLeague.term);
+    const shouldDuplicateTeams = duplicateTeams === true || duplicateTeams === "true" || (targetTerm && entityId(targetTerm) !== entityId(sourceLeague.term));
 
     if (shouldDuplicateTeams && sourceTeams.length > 0) {
       const oldToNewMap = {};
@@ -723,6 +752,10 @@ exports.cloneLeague = async (req, res) => {
           ageGroup: t.ageGroup || "",
           teamType: t.teamType || "INTERNAL",
           term: targetTerm,
+          termScope,
+          year,
+          startDate: termDoc ? null : newStartDate,
+          endDate: termDoc ? null : newEndDate,
           normalizedName: normalizeTeamName(t.teamName),
           dayOfWeek: t.dayOfWeek,
           startTime: t.startTime,
@@ -761,6 +794,8 @@ exports.cloneLeague = async (req, res) => {
     const clonedLeague = new League({
       name: newName,
       season: newSeason,
+      year,
+      termScope,
       logo: newLogo,
       description: description !== undefined ? description : (sourceLeague.description || ""),
       startDate: newStartDate,
@@ -1047,6 +1082,8 @@ exports.getAllLeagues = async (req, res) => {
     const type = (req.query.type || req.query.leagueType || "")?.trim().toUpperCase();
     const status = req.query.status?.trim().toUpperCase();
     const term = req.query.term || req.query.termId;
+    const termScope = String(req.query.termScope || "").toUpperCase();
+    const year = req.query.year ? parseAcademicYear(req.query.year) : null;
 
     const skip = (page - 1) * limit;
 
@@ -1078,15 +1115,20 @@ exports.getAllLeagues = async (req, res) => {
     }
 
     if (status && status !== "ALL") {
-      if (["UPCOMING", "ACTIVE", "COMPLETED"].includes(status)) {
+      if (["UPCOMING", "ACTIVE", "COMPLETED", "DRAFT"].includes(status)) {
         filter.status = status;
       }
     }
 
-    if (term && term !== "ALL") {
-      if (mongoose.Types.ObjectId.isValid(term)) {
-        filter.term = term;
-      }
+    if (termScope && termScope !== "ALL" && !["TERM", "INDEPENDENT"].includes(termScope)) throw domainError("Invalid term scope.");
+    if (termScope === "INDEPENDENT" || term === "INDEPENDENT") filter.term = null;
+    else if (term && term !== "ALL") {
+      if (!mongoose.Types.ObjectId.isValid(term)) throw domainError("Invalid term ID.");
+      filter.term = term;
+    } else if (termScope === "TERM") filter.term = { $ne: null };
+    if (year) {
+      const matchingTermIds = await Term.find({ year }).distinct("_id");
+      filter.$and = [...(filter.$and || []), { $or: [{ year }, { term: { $in: matchingTermIds } }] }];
     }
 
     const [leagues, total] = await Promise.all([
@@ -1244,6 +1286,9 @@ exports.createTeam = async (req, res) => {
       ageGroup,
       teamType,
       term,
+      termScope: requestedTermScope,
+      startDate,
+      endDate,
       dayOfWeek,
       startTime,
       endTime,
@@ -1252,6 +1297,7 @@ exports.createTeam = async (req, res) => {
       scheduleType,
       schedule,
       players,
+      externalPlayers,
     } = req.body;
 
     if (!teamName) {
@@ -1261,9 +1307,19 @@ exports.createTeam = async (req, res) => {
       });
     }
 
-    if (!String(teamName).trim() || !mongoose.Types.ObjectId.isValid(term) || !await Term.exists({ _id: term })) throw domainError("A valid term and team name are required.");
+    if (!String(teamName).trim()) throw domainError("A team name is required.");
+    const { termScope, termDoc } = await resolveAcademicScope({ term, termScope: requestedTermScope });
+    const parsedStartDate = startDate ? parseDateToMidnight(startDate) : null;
+    const parsedEndDate = endDate ? parseDateToMidnight(endDate) : null;
+    if ((startDate && !parsedStartDate) || (endDate && !parsedEndDate) || (!!parsedStartDate !== !!parsedEndDate)) throw domainError("Provide valid start and end dates together.");
+    if (parsedStartDate && parsedEndDate < parsedStartDate) throw domainError("End date cannot be earlier than start date.");
+    const { round, sessionDates: parsedSessionDates } = parseRoundAndDates(req.body);
+    const year = termDoc?.year || parseAcademicYear(req.body.year, parsedStartDate?.getUTCFullYear() || parsedSessionDates[0]?.getUTCFullYear());
     const normalizedName = normalizeTeamName(teamName);
-    const existingTeam = await Team.findOne({ term, $or: [{ normalizedName }, { teamName: { $regex: `^${escapeRegex(String(teamName).trim())}$`, $options: "i" } }] });
+    const existingTeam = await Team.findOne({
+      ...(termDoc ? { term: termDoc._id } : { termScope: "INDEPENDENT", year }),
+      $or: [{ normalizedName }, { teamName: { $regex: `^${escapeRegex(String(teamName).trim())}$`, $options: "i" } }],
+    });
 
     if (existingTeam) {
       return res.status(409).json({
@@ -1282,10 +1338,31 @@ exports.createTeam = async (req, res) => {
       ? `uploads/teamlogos/${req.file.filename}`
       : "";
 
-    // Parse players
+    // External-team roster entries are standalone rival details, never User IDs.
+    let parsedExternalPlayers = [];
+    if (parsedType === "EXTERNAL" && externalPlayers) {
+      try {
+        parsedExternalPlayers = typeof externalPlayers === "string" ? JSON.parse(externalPlayers) : externalPlayers;
+      } catch {
+        throw domainError("Invalid external players JSON.");
+      }
+      if (!Array.isArray(parsedExternalPlayers) || parsedExternalPlayers.length > 50) {
+        throw domainError("External team rosters must contain up to 50 players.");
+      }
+      parsedExternalPlayers = parsedExternalPlayers.map((player) => ({
+        name: String(player?.name || "").trim(),
+        jerseyNumber: String(player?.jerseyNumber ?? "").trim(),
+        user: String(player?.user || "").trim(),
+      }));
+      if (parsedExternalPlayers.some((player) => !player.name || !player.jerseyNumber)) {
+        throw domainError("Each external player needs a name and jersey number.");
+      }
+    }
+
+    // Parse academy players for internal teams only.
     let parsedPlayers = [];
 
-    if (players) {
+    if (parsedType === "INTERNAL" && players) {
       let rawPlayers = players;
 
       if (typeof rawPlayers === "string") {
@@ -1356,9 +1433,13 @@ exports.createTeam = async (req, res) => {
 
       teamType: parsedType,
 
-      term,
-      round: parseRoundAndDates(req.body).round,
-      sessionDates: parseRoundAndDates(req.body).sessionDates,
+      term: termDoc?._id || null,
+      termScope,
+      year,
+      startDate: termDoc ? null : parsedStartDate,
+      endDate: termDoc ? null : parsedEndDate,
+      round,
+      sessionDates: parsedSessionDates,
       teamFee: Number(req.body.fee ?? req.body.teamFee ?? 0),
 
       dayOfWeek: dayOfWeek || "",
@@ -1372,6 +1453,7 @@ exports.createTeam = async (req, res) => {
       schedule: schedule || [],
 
       players: parsedPlayers,
+      externalPlayers: parsedExternalPlayers,
     });
 
     created = true;
@@ -1396,6 +1478,8 @@ exports.getAllTeams = async (req, res) => {
     const page = parseInt(req.query.page, 10) || 1;
     const limit = parseInt(req.query.limit, 10) || 10;
     const search = req.query.search?.trim() || "";
+    const termScope = String(req.query.termScope || "").toUpperCase();
+    const year = req.query.year ? parseAcademicYear(req.query.year) : null;
 
     const skip = (page - 1) * limit;
 
@@ -1414,9 +1498,16 @@ exports.getAllTeams = async (req, res) => {
       filter.teamType = req.query.teamType.toUpperCase();
     }
 
-    if (req.query.termId || req.query.term) {
-      filter.term = req.query.termId || req.query.term;
-      if (!mongoose.Types.ObjectId.isValid(filter.term)) throw domainError("Invalid term ID.");
+    const requestedTerm = req.query.termId || req.query.term;
+    if (termScope && termScope !== "ALL" && !["TERM", "INDEPENDENT"].includes(termScope)) throw domainError("Invalid term scope.");
+    if (termScope === "INDEPENDENT" || requestedTerm === "INDEPENDENT") filter.term = null;
+    else if (requestedTerm && requestedTerm !== "ALL") {
+      if (!mongoose.Types.ObjectId.isValid(requestedTerm)) throw domainError("Invalid term ID.");
+      filter.term = requestedTerm;
+    } else if (termScope === "TERM") filter.term = { $ne: null };
+    if (year) {
+      const matchingTermIds = await Term.find({ year }).distinct("_id");
+      filter.$and = [...(filter.$and || []), { $or: [{ year }, { term: { $in: matchingTermIds } }] }];
     }
 
     const [teams, total] = await Promise.all([
@@ -1427,6 +1518,7 @@ exports.getAllTeams = async (req, res) => {
         .populate("captain", "name email profileImage")
         .populate("viceCaptain", "name email profileImage")
         .populate("players.player", "fullName email profileImage")
+        .populate("leagues.league", "name season term")
         .sort({ createdAt: -1, _id: -1 })
         .skip(skip)
         .limit(limit),
@@ -1472,6 +1564,7 @@ exports.assignPlayerToTeam = async (req, res) => {
     // Reading and saving the same Team in the transaction serializes roster capacity changes.
     const team = await Team.findById(teamId).session(session);
     if (!team || team.archivedAt) throw domainError("Team not found.", 404);
+    if (team.teamType === "EXTERNAL") throw domainError("External teams use a separate rival roster and cannot be assigned academy players.", 409);
     if (await User.countDocuments({ _id: { $in: entries.map((row) => row.player) }, isBlocked: { $ne: true } }).session(session) !== entries.length) throw domainError("One or more selected players is unavailable.");
     let enrollment;
     if (leagueId) {
@@ -1502,6 +1595,50 @@ exports.assignPlayerToTeam = async (req, res) => {
     if (session?.inTransaction()) await session.abortTransaction();
     return res.status(error.statusCode || ([11000, 112, 251].includes(error.code) ? 409 : 500)).json({ success: false, message: error.message });
   } finally { if (session) await session.endSession(); }
+};
+
+exports.updateExternalTeamPlayers = async (req, res) => {
+  try {
+    const { teamId } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(teamId)) throw domainError("Invalid team ID.");
+    let externalPlayers = req.body.externalPlayers;
+    if (typeof externalPlayers === "string") {
+      try { externalPlayers = JSON.parse(externalPlayers); }
+      catch { throw domainError("Invalid external players JSON."); }
+    }
+    if (!Array.isArray(externalPlayers) || externalPlayers.length > 50) {
+      throw domainError("External team rosters must contain up to 50 players.");
+    }
+
+    const team = await Team.findOne({ _id: teamId, archivedAt: null });
+    if (!team) throw domainError("Team not found.", 404);
+    if (team.teamType !== "EXTERNAL") throw domainError("Rival roster details can only be added to external teams.", 409);
+
+    const existingPlayers = new Map((team.externalPlayers || []).map((player) => [player._id.toString(), player]));
+    const entries = externalPlayers.map((player) => {
+      const name = String(player?.name || "").trim();
+      const jerseyNumber = String(player?.jerseyNumber ?? "").trim();
+      const user = String(player?.user || "").trim();
+      if (!name || !jerseyNumber || name.length > 100 || jerseyNumber.length > 10 || user.length > 100) {
+        throw domainError("Each rival player needs a name (up to 100 characters) and jersey number (up to 10 characters); user/contact is optional.");
+      }
+      if (player?._id) {
+        if (!mongoose.Types.ObjectId.isValid(player._id) || !existingPlayers.has(String(player._id))) throw domainError("One or more rival players no longer belong to this team's roster.", 409);
+        return { _id: player._id, name, jerseyNumber, user };
+      }
+      return { name, jerseyNumber, user };
+    });
+    team.externalPlayers = entries;
+    await team.save();
+
+    return res.json({
+      success: true,
+      message: "Rival team roster saved successfully.",
+      data: { _id: team._id, externalPlayers: team.externalPlayers },
+    });
+  } catch (error) {
+    return res.status(error.statusCode || (error.name === "ValidationError" || error.name === "CastError" ? 400 : 500)).json({ success: false, message: error.message });
+  }
 };
 
 exports.getAvailablePlayers = async (req, res) => {
@@ -1821,6 +1958,8 @@ exports.getTeamById = async (req, res) => {
     }
 
     const teamObj = team.toObject ? team.toObject() : { ...team };
+    teamObj.termScope = teamObj.term ? "TERM" : "INDEPENDENT";
+    teamObj.year ||= teamObj.term?.year || (teamObj.startDate ? new Date(teamObj.startDate).getUTCFullYear() : undefined);
     if (!require("../utils/coachPermissions").can(req.admin, "parents", "read")) {
       for (const entry of teamObj.players || []) if (entry.player && typeof entry.player === "object") entry.player.parentId = null;
       for (const league of teamObj.leagues || []) {
@@ -2048,7 +2187,15 @@ exports.getTeamPlayers = async (req, res) => {
       const captainId = team.captain ? (team.captain._id ? team.captain._id.toString() : team.captain.toString()) : null;
       const viceCaptainId = team.viceCaptain ? (team.viceCaptain._id ? team.viceCaptain._id.toString() : team.viceCaptain.toString()) : null;
 
-      const formattedPlayers = (team.players || [])
+      const formattedPlayers = team.teamType === "EXTERNAL"
+        ? (team.externalPlayers || []).map((player) => ({
+          _id: player._id,
+          name: player.name || "",
+          fullName: player.name || "",
+          jerseyNumber: player.jerseyNumber || "",
+          isExternal: true,
+        }))
+        : (team.players || [])
         .filter((item) => item && item.player)
         .map((item) => {
           const p = item.player;
@@ -2089,7 +2236,7 @@ exports.getTeamPlayers = async (req, res) => {
           };
         });
 
-      const formattedTemporaryPlayers = (team.temporaryPlayers || []).map((tp) => ({
+      const formattedTemporaryPlayers = team.teamType === "EXTERNAL" ? [] : (team.temporaryPlayers || []).map((tp) => ({
         _id: tp._id,
         name: tp.name || "",
         fullName: tp.name || "",
@@ -2117,9 +2264,10 @@ exports.getTeamPlayers = async (req, res) => {
           ageGroup: team.ageGroup || "",
           coach: team.coach || null,
           assistantCoach: team.assistantCoach || null,
-          captain: team.captain || null,
-          viceCaptain: team.viceCaptain || null,
+          captain: team.teamType === "EXTERNAL" ? null : team.captain || null,
+          viceCaptain: team.teamType === "EXTERNAL" ? null : team.viceCaptain || null,
           teamType: team.teamType || "INTERNAL",
+          externalPlayers: team.teamType === "EXTERNAL" ? team.externalPlayers || [] : [],
         },
         totalPlayers: formattedPlayers.length,
         totalTemporaryPlayers: formattedTemporaryPlayers.length,
@@ -2349,6 +2497,9 @@ exports.updateTeam = async (req, res) => {
       teamFee,
       fee,
       term,
+      termScope: requestedTermScope,
+      startDate,
+      endDate,
       dayOfWeek,
       startTime,
       endTime,
@@ -2368,7 +2519,30 @@ exports.updateTeam = async (req, res) => {
     }
 
     if (team.archivedAt) throw domainError("Archived teams cannot be modified.", 409);
-    if (term !== undefined && entityId(term) !== entityId(team.term)) throw domainError("A team belongs to one term. Clone it to create an independent team in another term.", 409);
+    const priorTermId = entityId(team.term);
+    const priorTermDoc = team.term ? await Term.findById(team.term) : null;
+    const nextScope = requestedTermScope || (term === "" ? "INDEPENDENT" : team.term ? "TERM" : "INDEPENDENT");
+    const nextTerm = term !== undefined ? term : String(nextScope).toUpperCase() === "INDEPENDENT" ? null : team.term;
+    const { termScope, termDoc } = await resolveAcademicScope({ termScope: nextScope, term: nextTerm });
+    if (priorTermId && termDoc && priorTermId !== entityId(termDoc)) throw domainError("A team belongs to one term. Clone it to move to another term.", 409);
+    const enrolledLeagueIds = (team.leagues || []).map((entry) => entry.league).filter(Boolean);
+    if (enrolledLeagueIds.length) {
+      const linkedLeagues = await League.find({ _id: { $in: enrolledLeagueIds }, archivedAt: null, term: { $ne: null } }).select("term");
+      if (linkedLeagues.some((league) => !termDoc || entityId(league.term) !== entityId(termDoc))) throw domainError("Remove this team from term-linked tournaments before changing its academic term.", 409);
+    }
+    team.term = termDoc?._id || null;
+    team.termScope = termScope;
+    if (termDoc) {
+      team.year = termDoc.year;
+      team.startDate = null;
+      team.endDate = null;
+    } else {
+      team.startDate = startDate === undefined ? team.startDate : startDate ? parseDateToMidnight(startDate) : null;
+      team.endDate = endDate === undefined ? team.endDate : endDate ? parseDateToMidnight(endDate) : null;
+      if ((startDate && !team.startDate) || (endDate && !team.endDate) || (!!team.startDate !== !!team.endDate)) throw domainError("Provide valid start and end dates together.");
+      if (team.startDate && team.endDate < team.startDate) throw domainError("End date cannot be earlier than start date.");
+      team.year = parseAcademicYear(req.body.year, team.year || priorTermDoc?.year || team.startDate?.getUTCFullYear() || team.sessionDates?.[0]?.getUTCFullYear());
+    }
     if (dayOfWeek !== undefined) team.dayOfWeek = dayOfWeek;
     if (startTime !== undefined) team.startTime = startTime;
     if (endTime !== undefined) team.endTime = endTime;
@@ -2398,16 +2572,15 @@ exports.updateTeam = async (req, res) => {
         return res.status(400).json({ success: false, message: "Team name cannot be empty" });
       }
 
-      const duplicateTeam = await Team.findOne({
-        _id: { $ne: teamId },
-        term: team.term,
-        $or: [{ normalizedName: normalizeTeamName(trimmedName) }, { teamName: { $regex: `^${escapeRegex(trimmedName)}$`, $options: "i" } }],
-      });
-      if (duplicateTeam) {
-        return res.status(409).json({ success: false, message: "Another team already exists with this name" });
-      }
       team.teamName = trimmedName;
     }
+
+    const duplicateTeam = await Team.findOne({
+      _id: { $ne: teamId },
+      ...(termDoc ? { term: termDoc._id } : { termScope: "INDEPENDENT", year: team.year }),
+      $or: [{ normalizedName: normalizeTeamName(team.teamName) }, { teamName: { $regex: `^${escapeRegex(String(team.teamName).trim())}$`, $options: "i" } }],
+    });
+    if (duplicateTeam) return res.status(409).json({ success: false, message: "Another team already exists with this name" });
 
     if (teamType !== undefined) {
       const upperType = teamType.toUpperCase();
@@ -2848,7 +3021,7 @@ exports.getAdminLeagueData = async (req, res) => {
 
     const league = await League.findById(leagueId).populate("term", "name year startDate endDate").populate({
       path: "teams",
-      select: "teamName logo coach assistantCoach ageGroup teamType players leagues temporaryPlayers statistics",
+      select: "teamName logo coach assistantCoach ageGroup teamType players externalPlayers leagues temporaryPlayers statistics",
       populate: [
         { path: "coach", select: "name email mobile profileImage" },
         { path: "assistantCoach", select: "name email mobile profileImage" },
@@ -2871,7 +3044,7 @@ exports.getAdminLeagueData = async (req, res) => {
     })
       .populate({
         path: "team",
-        select: "teamName logo coach assistantCoach ageGroup teamType players leagues temporaryPlayers statistics",
+        select: "teamName logo coach assistantCoach ageGroup teamType players externalPlayers leagues temporaryPlayers statistics",
         populate: [
           { path: "coach", select: "name email mobile profileImage" },
           { path: "assistantCoach", select: "name email mobile profileImage" },
@@ -2919,9 +3092,11 @@ exports.getAdminLeagueData = async (req, res) => {
       const leagueStat = leagueEntry?.statistics;
       const record = s || leagueStat || { played: 0, won: 0, drawn: 0, lost: 0, goalsFor: 0, goalsAgainst: 0, goalDifference: 0, points: 0 };
 
-      const playersCount =
-        (Array.isArray(t.players) ? t.players.length : 0) +
-        (Array.isArray(t.temporaryPlayers) ? t.temporaryPlayers.length : 0);
+      const externalPlayers = Array.isArray(t.externalPlayers) ? t.externalPlayers : [];
+      const playersCount = t.teamType === "EXTERNAL"
+        ? externalPlayers.length
+        : (Array.isArray(t.players) ? t.players.length : 0) +
+          (Array.isArray(t.temporaryPlayers) ? t.temporaryPlayers.length : 0);
 
       return {
         _id: t._id,
@@ -2929,6 +3104,7 @@ exports.getAdminLeagueData = async (req, res) => {
         logo: t.logo || "",
         ageGroup: t.ageGroup || "",
         teamType: t.teamType || "INTERNAL",
+        externalPlayers: t.teamType === "EXTERNAL" ? externalPlayers : [],
         coach: t.coach
           ? {
             _id: t.coach._id,
@@ -3038,6 +3214,13 @@ exports.getAdminLeagueData = async (req, res) => {
             _id: g._id,
             teamId: teamIdStr,
             teamName,
+            externalScorerId: g.externalScorerId || "",
+            externalScorerName: g.externalScorerName || "",
+            externalScorerJerseyNumber: g.externalScorerJerseyNumber || "",
+            unknownScorer: Boolean(g.unknownScorer),
+            externalAssistId: g.externalAssistId || "",
+            externalAssistName: g.externalAssistName || "",
+            externalAssistJerseyNumber: g.externalAssistJerseyNumber || "",
             scorer: g.scorer
               ? {
                 _id: g.scorer._id,
@@ -3323,6 +3506,8 @@ exports.getAdminLeagueData = async (req, res) => {
         _id: league._id,
         name: league.name,
         season: league.season,
+        year: league.year || league.term?.year || league.startDate?.getUTCFullYear(),
+        termScope: league.term ? "TERM" : "INDEPENDENT",
         term: league.term,
         venue: league.venue,
         fee: league.fee,
@@ -3386,6 +3571,8 @@ exports.getAdminLeagueData = async (req, res) => {
         _id: league._id,
         name: league.name,
         season: league.season,
+        year: league.year || league.term?.year || league.startDate?.getUTCFullYear(),
+        termScope: league.term ? "TERM" : "INDEPENDENT",
         term: league.term,
         venue: league.venue,
         fee: league.fee,
@@ -3449,7 +3636,11 @@ exports.updateLeague = async (req, res) => {
     const league = await League.findById(leagueId).session(session);
     if (!league || league.archivedAt) throw domainError("League not found.", 404);
     const body = req.body;
-    if (body.term !== undefined && entityId(body.term) !== entityId(league.term)) throw domainError("League term cannot change. Clone this league into the target term.", 409);
+    const priorTermId = entityId(league.term);
+    const requestedScope = body.termScope || (body.term === "" ? "INDEPENDENT" : league.term ? "TERM" : "INDEPENDENT");
+    const requestedTerm = body.term !== undefined ? body.term : String(requestedScope).toUpperCase() === "INDEPENDENT" ? null : league.term;
+    const { termScope, termDoc } = await resolveAcademicScope({ termScope: requestedScope, term: requestedTerm });
+    if (priorTermId && termDoc && priorTermId !== entityId(termDoc)) throw domainError("League term cannot change. Clone this league into the target term.", 409);
     for (const key of ["name", "season", "description", "venue"]) if (body[key] !== undefined) league[key] = String(body[key]).trim();
     if (!league.name || !league.season) throw domainError("Name and season are required.");
     if (await League.exists({ _id: { $ne: leagueId }, name: league.name, season: league.season }).session(session)) throw domainError("League already exists for this season.", 409);
@@ -3458,6 +3649,9 @@ exports.updateLeague = async (req, res) => {
       if (body[key] && !league[key]) throw domainError(`Invalid ${key}.`);
     }
     if (!league.startDate || !league.endDate || league.endDate < league.startDate) throw domainError("Valid ordered start and end dates are required.");
+    league.termScope = termScope;
+    league.term = termDoc?._id || null;
+    league.year = termDoc?.year || parseAcademicYear(body.year, league.year || league.startDate.getUTCFullYear());
     if (league.registrationStartDate && league.registrationEndDate && league.registrationEndDate < league.registrationStartDate) throw domainError("Registration end must follow registration start.");
     for (const key of ["numberOfRounds", "groupCount", "numberOfFields", "matchDuration"]) if (body[key] !== undefined) {
       if (!Number.isInteger(Number(body[key])) || Number(body[key]) < 1) throw domainError(`${key} must be a positive integer.`);
@@ -3471,11 +3665,12 @@ exports.updateLeague = async (req, res) => {
       if (![true, false, "true", "false"].includes(body[key])) throw domainError(`${key} must be boolean.`);
       league[key] = body[key] === true || body[key] === "true";
     }
-    const enums = { status: ["UPCOMING", "ACTIVE", "COMPLETED"], visibility: ["PUBLIC", "PRIVATE"], fixtureFormat: ["ROUND_ROBIN", "GROUP", "KNOCKOUT"], generationType: ["AUTOMATIC", "MANUAL"] };
+    const enums = { status: ["UPCOMING", "ACTIVE", "COMPLETED", "DRAFT"], visibility: ["PUBLIC", "PRIVATE"], fixtureFormat: ["ROUND_ROBIN", "GROUP", "KNOCKOUT"], generationType: ["AUTOMATIC", "MANUAL"] };
     for (const [key, choices] of Object.entries(enums)) if (body[key] !== undefined) {
       const value = String(body[key]).toUpperCase();
-      if (!choices.includes(value)) throw domainError(`Invalid ${key}.`);
-      league[key] = value;
+      const normalizedValue = key === "visibility" && value === "INTERNAL" ? "PRIVATE" : value;
+      if (!choices.includes(normalizedValue)) throw domainError(`Invalid ${key}.`);
+      league[key] = normalizedValue;
     }
     const type = body.type || body.leagueType || body.competitionScope;
     if (type !== undefined) {
@@ -3504,6 +3699,10 @@ exports.updateLeague = async (req, res) => {
       assertTeamLeagueScope(league, teams, false);
       league.teams = ids;
     }
+    if (termDoc) {
+      const selectedTeams = await Team.find({ _id: { $in: league.teams } }).session(session);
+      assertTeamLeagueScope(league, selectedTeams, false);
+    }
     const nextIds = (league.teams || []).map(entityId);
     const removed = previousIds.filter((id) => !nextIds.includes(id));
     if (removed.length && await Fixture.exists({ league: leagueId, $or: [{ homeTeam: { $in: removed } }, { awayTeam: { $in: removed } }] }).session(session)) throw domainError("Cannot remove teams referenced by fixtures. Historical matches must be preserved.", 409);
@@ -3516,6 +3715,7 @@ exports.updateLeague = async (req, res) => {
     if (await Fixture.exists({ league: leagueId, round: { $gt: league.numberOfRounds } }).session(session)) throw domainError("Round count cannot exclude existing fixtures.", 409);
     if (await Fixture.exists({ league: leagueId, field: { $nin: Array.from({ length: league.numberOfFields }, (_, i) => `Field ${i + 1}`) } }).session(session)) throw domainError("Field count cannot exclude existing fixtures. Update fixtures first.", 409);
     if (req.file) { oldLogo = league.logo; league.logo = `/uploads/leaguelogos/${req.file.filename}`; }
+    else if (body.removeLeagueLogo === "true") { oldLogo = league.logo; league.logo = ""; }
     await league.save({ session });
     await syncTeamsLeagueData({ teamIds: league.teams, leagueId, teamFee: league.fee, round: league.numberOfRounds, sessionDates: league.sessionDates, groups: league.groups, sessionOption: { session } });
     if (removed.length) {
@@ -3823,8 +4023,15 @@ exports.updateFixture = async (req, res) => {
       ? match.goals.map((g) => ({
         _id: g._id,
         team: (g.team?._id || g.team)?.toString(),
-        scorer: (g.scorer?._id || g.scorer)?.toString(),
+        scorer: (g.scorer?._id || g.scorer)?.toString() || null,
+        externalScorerId: g.externalScorerId || "",
+        externalScorerName: g.externalScorerName || "",
+        externalScorerJerseyNumber: g.externalScorerJerseyNumber || "",
+        unknownScorer: Boolean(g.unknownScorer),
         assist: (g.assist?._id || g.assist)?.toString() || null,
+        externalAssistId: g.externalAssistId || "",
+        externalAssistName: g.externalAssistName || "",
+        externalAssistJerseyNumber: g.externalAssistJerseyNumber || "",
         minute: g.minute !== undefined ? Number(g.minute) : 0,
       }))
       : [];
@@ -3872,8 +4079,13 @@ exports.updateFixture = async (req, res) => {
 
     // Score submission finalizes even a 0-0 result; explicit LIVE remains a draft.
     const hasResult = homeScore != null || awayScore != null || score?.homeScore != null || score?.awayScore != null;
-    if (status && !["SCHEDULED", "LIVE", "COMPLETED", "POSTPONED"].includes(String(status).toUpperCase())) throw domainError("Invalid fixture status.");
+    if (status && !["SCHEDULED", "LIVE", "COMPLETED", "POSTPONED", "CANCELLED"].includes(String(status).toUpperCase())) throw domainError("Invalid fixture status.");
     const newStatus = req.body.finalize === true ? "COMPLETED" : status ? String(status).toUpperCase() : hasResult ? "COMPLETED" : oldStatus;
+    const cancellationReason = newStatus === "CANCELLED"
+      ? String(req.body.cancellationReason ?? match.cancellationReason ?? "").trim()
+      : "";
+    if (newStatus === "CANCELLED" && !cancellationReason) throw domainError("A cancellation reason is required.");
+    if (newStatus === "CANCELLED" && ["LIVE", "COMPLETED"].includes(oldStatus)) throw domainError("Live or completed matches cannot be cancelled.", 409);
     const newHomeTeam = homeTeam !== undefined ? entityId(homeTeam) : entityId(oldHomeTeam);
     const newAwayTeam = awayTeam !== undefined ? entityId(awayTeam) : entityId(oldAwayTeam);
     if (![newHomeTeam, newAwayTeam].every(mongoose.Types.ObjectId.isValid)) throw domainError("Invalid team ID.");
@@ -3927,9 +4139,14 @@ exports.updateFixture = async (req, res) => {
       for (let i = 0; i < goals.length; i++) {
         const g = goals[i];
         const gTeamId = (g.teamId || g.team)?.toString();
-        const scorerId = (g.scorerId || g.scorer?._id || g.scorer)?.toString();
+        const rawScorer = (g.scorerId || g.scorer?._id || g.scorer)?.toString() || "";
+        const unknownScorer = g.unknownScorer === true || rawScorer === "unknown";
+        const externalScorerId = unknownScorer ? "" : String(g.externalScorerId || (rawScorer.startsWith("external:") ? rawScorer.slice("external:".length) : "")).trim();
+        const scorerId = unknownScorer || externalScorerId ? "" : rawScorer;
         const rawAssist = g.assistId !== undefined ? g.assistId : (g.assist?._id || g.assist);
-        const assistId = (rawAssist && String(rawAssist).trim().length > 0) ? String(rawAssist).trim() : null;
+        const rawAssistId = (rawAssist && String(rawAssist).trim().length > 0) ? String(rawAssist).trim() : "";
+        const externalAssistId = String(g.externalAssistId || (rawAssistId.startsWith("external:") ? rawAssistId.slice("external:".length) : "")).trim();
+        const assistId = externalAssistId ? "" : rawAssistId;
         const minute = Number(g.minute);
 
         if (!gTeamId || (gTeamId !== homeTeamStr && gTeamId !== awayTeamStr)) {
@@ -3946,22 +4163,29 @@ exports.updateFixture = async (req, res) => {
           });
         }
 
-        if (!scorerId || !mongoose.Types.ObjectId.isValid(scorerId)) {
-          return res.status(400).json({
-            success: false,
-            message: `Goal at index ${i}: Invalid or missing scorer ID`,
-          });
-        }
-
         const scoringTeamDoc = gTeamId === homeTeamStr ? homeTeamDoc : awayTeamDoc;
-        if (!checkPlayerBelongsToTeam(scorerId, scoringTeamDoc)) {
-          return res.status(400).json({
-            success: false,
-            message: `Goal at index ${i}: Scorer ${scorerId} does not belong to team ${gTeamId}`,
-          });
+        let externalScorer = null;
+        if (externalScorerId) {
+          if (scoringTeamDoc.teamType !== "EXTERNAL" || !mongoose.Types.ObjectId.isValid(externalScorerId)) throw domainError(`Goal at index ${i}: Select a player from this external team's rival roster.`);
+          externalScorer = (scoringTeamDoc.externalPlayers || []).id(externalScorerId)
+            || (match.goals || []).find((goal) => entityId(goal.team) === gTeamId && String(goal.externalScorerId || "") === externalScorerId);
+          if (!externalScorer) throw domainError(`Goal at index ${i}: Rival scorer is not on this team's roster.`);
+        } else if (!unknownScorer) {
+          if (!scorerId || !mongoose.Types.ObjectId.isValid(scorerId)) {
+            return res.status(400).json({ success: false, message: `Goal at index ${i}: Invalid or missing scorer ID` });
+          }
+          if (!checkPlayerBelongsToTeam(scorerId, scoringTeamDoc)) {
+            return res.status(400).json({ success: false, message: `Goal at index ${i}: Scorer ${scorerId} does not belong to team ${gTeamId}` });
+          }
         }
 
-        if (assistId) {
+        let externalAssist = null;
+        if (externalAssistId) {
+          if (scoringTeamDoc.teamType !== "EXTERNAL" || !mongoose.Types.ObjectId.isValid(externalAssistId)) throw domainError(`Goal at index ${i}: Select the assist from this external team's rival roster.`);
+          externalAssist = (scoringTeamDoc.externalPlayers || []).id(externalAssistId)
+            || (match.goals || []).find((goal) => entityId(goal.team) === gTeamId && String(goal.externalAssistId || "") === externalAssistId);
+          if (!externalAssist || externalAssistId === externalScorerId) throw domainError(`Goal at index ${i}: Select a different rival player for the assist.`);
+        } else if (assistId) {
           if (!mongoose.Types.ObjectId.isValid(assistId)) {
             return res.status(400).json({
               success: false,
@@ -3978,8 +4202,15 @@ exports.updateFixture = async (req, res) => {
 
         validatedGoals.push({
           team: gTeamId,
-          scorer: scorerId,
+          scorer: scorerId || null,
+          externalScorerId: externalScorer?._id?.toString() || "",
+          externalScorerName: externalScorer?.name || "",
+          externalScorerJerseyNumber: externalScorer?.jerseyNumber || "",
+          unknownScorer,
           assist: assistId || null,
+          externalAssistId: externalAssist?._id?.toString() || "",
+          externalAssistName: externalAssist?.name || "",
+          externalAssistJerseyNumber: externalAssist?.jerseyNumber || "",
           minute,
         });
       }
@@ -4074,6 +4305,7 @@ exports.updateFixture = async (req, res) => {
       match.score.homeScore = newHomeScore;
       match.score.awayScore = newAwayScore;
       match.status = newStatus;
+      match.cancellationReason = cancellationReason;
       match.resultPlayers = newResultPlayers;
       match.homeTeam = newHomeTeam;
       match.awayTeam = newAwayTeam;
@@ -4332,6 +4564,13 @@ exports.updateFixture = async (req, res) => {
           _id: g._id,
           teamId: teamIdStr,
           teamName,
+          externalScorerId: g.externalScorerId || "",
+          externalScorerName: g.externalScorerName || "",
+          externalScorerJerseyNumber: g.externalScorerJerseyNumber || "",
+          unknownScorer: Boolean(g.unknownScorer),
+          externalAssistId: g.externalAssistId || "",
+          externalAssistName: g.externalAssistName || "",
+          externalAssistJerseyNumber: g.externalAssistJerseyNumber || "",
           scorer: g.scorer
             ? {
               _id: g.scorer._id,

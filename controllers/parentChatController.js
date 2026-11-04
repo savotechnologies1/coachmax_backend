@@ -89,14 +89,14 @@ async function resolveEventDayAudience({ eventId, sessionDate, campSessionId }) 
       error.statusCode = 400;
       throw error;
     }
-    if (selectedSession.isAvailable === false) {
+    if (selectedSession.isAvailable === false && !selectedSession.isCancelled) {
       const error = new Error("The selected camp session is unavailable");
       error.statusCode = 409;
       throw error;
     }
   }
 
-  const availableSessions = sessionsForDate.filter((session) => session.isAvailable !== false);
+  const availableSessions = sessionsForDate.filter((session) => session.isAvailable !== false || session.isCancelled);
   const audienceSessions = selectedSession ? [selectedSession] : availableSessions;
   if (audienceSessions.length === 0) {
     const error = new Error("This event date is unavailable");
