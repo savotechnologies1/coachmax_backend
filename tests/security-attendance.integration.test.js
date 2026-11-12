@@ -196,7 +196,7 @@ test("durable email delivery retries rejection and keeps intent idempotent", asy
   assert.equal(await outbox.countDocuments({ deliveryKind: "EMAIL" }), 1);
   await processDeliveryJobs({ sendEmailFn: async () => false });
   let job = await outbox.findOne({ deliveryKind: "EMAIL" }); assert.equal(job.deliveryStatus, "PENDING"); assert.equal(job.deliveryAttempts, 1);
-  assert.equal(job.deliveryLastError, "Delivery failed");
+  assert.equal(job.deliveryLastError, "EMAIL_NOT_ACCEPTED");
   await outbox.updateOne({ _id: job._id }, { $set: { deliveryNextAttempt: new Date(0) } });
   let delivered = 0;
   await processDeliveryJobs({ sendEmailFn: async (to, subject, html) => { assert.equal(to, payload.to); assert.equal(html, payload.html); delivered++; return true; } });
