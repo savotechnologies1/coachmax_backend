@@ -14,6 +14,23 @@ try {
   ({ broadcastSidebarBadges } = require("../sockets/chatSocket"));
 } catch (e) {}
 
+const ORDER_STATUSES = ["PENDING", "PROCESSING", "SHIPPED", "DELIVERED", "CANCELLED"];
+const ORDER_PAYMENT_STATUSES = ["PENDING", "PAID", "FAILED", "REFUNDED"];
+const EFFECTIVE_ORDER_PAYMENT_STATUSES = [...ORDER_PAYMENT_STATUSES, "PAYMENT_PENDING"];
+
+function effectiveOrderPaymentStatus(order) {
+  if (["FAILED", "REFUNDED"].includes(order.paymentStatus)) return order.paymentStatus;
+  const invoiceStatus = order.invoice?.paymentStatus;
+  if (invoiceStatus === "PAID") return "PAID";
+  if (invoiceStatus === "PAYMENT_PENDING") return "PAYMENT_PENDING";
+  return invoiceStatus ? "PENDING" : order.paymentStatus || "PENDING";
+}
+
+function orderWithEffectivePaymentStatus(order) {
+  const data = order.toObject ? order.toObject() : order;
+  return { ...data, effectivePaymentStatus: effectiveOrderPaymentStatus(data) };
+}
+
 exports.createCategory = async (req, res) => {
   try {
     const { name, description } = req.body;
@@ -437,6 +454,7 @@ exports.getProductInsights = async (req, res) => {
         lineTotalMinor,
         variants: lines.map((item) => ({ size: item.selectedSize, color: item.selectedColor, quantity: item.quantity })),
         paymentStatus: order.paymentStatus,
+        effectivePaymentStatus: effectiveOrderPaymentStatus(order),
         orderStatus: order.status,
         invoice: order.invoice,
         createdAt: order.createdAt,
@@ -838,11 +856,14 @@ exports.getAllOrders = async (req, res) => {
     }
 
     if (status) {
+      if (!ORDER_STATUSES.includes(status)) {
+        return res.status(400).json({ success: false, message: "Invalid order status filter" });
+      }
       query.status = status;
     }
 
-    if (paymentStatus) {
-      query.paymentStatus = paymentStatus;
+    if (paymentStatus && !EFFECTIVE_ORDER_PAYMENT_STATUSES.includes(paymentStatus)) {
+      return res.status(400).json({ success: false, message: "Invalid payment status filter" });
     }
 
     if (startDate || endDate) {
@@ -881,19 +902,51 @@ exports.getAllOrders = async (req, res) => {
     const pageLimit = Math.min(100, Math.max(1, parseInt(limit, 10) || 10));
     const skip = (currentPage - 1) * pageLimit;
 
-    const [orders, total] = await Promise.all([
-      Order.find(query)
-        .populate("parent", "fullName email phone address city")
-        .populate({
-          path: "items.product",
-          select: "name price images stock category",
-          populate: { path: "category", select: "name" },
-        })
-        .populate("invoice", "invoiceNumber paymentStatus status subtotal totalAmount amount dueDate description notes createdAt")
-        .sort({ createdAt: -1 })
-        .skip(skip)
-        .limit(pageLimit),
-      Order.countDocuments(query),
+    const invoicePaymentStatus = { $arrayElemAt: ["$_invoicePayment.paymentStatus", 0] };
+    const [pageResult] = await Order.aggregate([
+      { $match: query },
+      { $sort: { createdAt: -1, _id: -1 } },
+      {
+        $lookup: {
+          from: Invoice.collection.name,
+          localField: "invoice",
+          foreignField: "_id",
+          pipeline: [{ $project: { paymentStatus: 1 } }],
+          as: "_invoicePayment",
+        },
+      },
+      {
+        $set: {
+          effectivePaymentStatus: {
+            $switch: {
+              branches: [
+                { case: { $in: ["$paymentStatus", ["FAILED", "REFUNDED"]] }, then: "$paymentStatus" },
+                { case: { $eq: [invoicePaymentStatus, "PAID"] }, then: "PAID" },
+                { case: { $eq: [invoicePaymentStatus, "PAYMENT_PENDING"] }, then: "PAYMENT_PENDING" },
+                { case: { $ne: [invoicePaymentStatus, null] }, then: "PENDING" },
+              ],
+              default: { $ifNull: ["$paymentStatus", "PENDING"] },
+            },
+          },
+        },
+      },
+      ...(paymentStatus ? [{ $match: { effectivePaymentStatus: paymentStatus } }] : []),
+      {
+        $facet: {
+          metadata: [{ $count: "total" }],
+          data: [{ $skip: skip }, { $limit: pageLimit }, { $project: { _invoicePayment: 0 } }],
+        },
+      },
+    ]);
+    const total = pageResult?.metadata?.[0]?.total || 0;
+    const orders = await Order.populate(pageResult?.data || [], [
+      { path: "parent", select: "fullName email phone address city" },
+      {
+        path: "items.product",
+        select: "name price images stock category",
+        populate: { path: "category", select: "name" },
+      },
+      { path: "invoice", select: "invoiceNumber paymentStatus status subtotal totalAmount amount dueDate description notes createdAt" },
     ]);
 
     return res.status(200).json({
@@ -939,7 +992,7 @@ exports.getOrderById = async (req, res) => {
 
     return res.status(200).json({
       success: true,
-      data: order,
+      data: orderWithEffectivePaymentStatus(order),
     });
   } catch (err) {
     return res.status(err.statusCode || err.status || (err.name === "CastError" || err.name === "ValidationError" || err instanceof SyntaxError ? 400 : err.name === "VersionError" || err.code === 11000 ? 409 : 500)).json({
@@ -950,60 +1003,54 @@ exports.getOrderById = async (req, res) => {
 };
 
 exports.updateOrderStatus = async (req, res) => {
+  const { id } = req.params;
+  const changes = req.body || {};
+  const hasStatus = Object.prototype.hasOwnProperty.call(changes, "status");
+  const hasPaymentStatus = Object.prototype.hasOwnProperty.call(changes, "paymentStatus");
+  const { status, paymentStatus } = changes;
+
+  if (!hasStatus && !hasPaymentStatus) {
+    return res.status(400).json({ success: false, message: "Provide an order status or payment status" });
+  }
+  if (hasStatus && !ORDER_STATUSES.includes(status)) {
+    return res.status(400).json({ success: false, message: "Invalid order status" });
+  }
+  if (hasPaymentStatus && !ORDER_PAYMENT_STATUSES.includes(paymentStatus)) {
+    return res.status(400).json({ success: false, message: "Invalid payment status" });
+  }
+
+  const session = await mongoose.startSession();
   try {
-    const { id } = req.params;
-    const { status, paymentStatus } = req.body;
+    await session.withTransaction(async () => {
+      const order = await Order.findById(id).session(session);
+      if (!order) throw Object.assign(new Error("Order not found"), { status: 404 });
 
-    const order = await Order.findById(id);
-    if (!order) {
-      return res.status(404).json({
-        success: false,
-        message: "Order not found",
-      });
-    }
+      const paymentChanged = hasPaymentStatus && paymentStatus !== order.paymentStatus;
+      if (paymentChanged && (order.paymentStatus === "REFUNDED" || order.paymentStatus === "PAID" || paymentStatus === "REFUNDED")) {
+        throw Object.assign(new Error("Paid and refunded orders require a Finance refund or reconciliation before changing their payment status."), { status: 409 });
+      }
 
-    if (paymentStatus === "PAID") {
-      const session = await mongoose.startSession();
-      session.startTransaction();
-      try {
-        const txOrder = await Order.findById(id).session(session);
-        const invoice = txOrder?.invoice ? await Invoice.findById(txOrder.invoice).session(session) : null;
+      if (hasPaymentStatus && paymentStatus === "PAID") {
+        const invoice = order.invoice ? await Invoice.findById(order.invoice).session(session) : null;
         if (!invoice) throw Object.assign(new Error("This order has no invoice. Create or reconcile its invoice before recording payment."), { status: 409 });
         await recordAdminPaymentForInvoice(invoice, req.admin?._id, session);
-        await session.commitTransaction();
-        const updatedOrder = await Order.findById(id).populate("parent", "fullName email phone").populate("invoice");
-        if (broadcastSidebarBadges) broadcastSidebarBadges().catch(() => {});
-        return res.status(200).json({ success: true, message: "Order payment, invoice, and transaction ledger synchronized.", data: updatedOrder });
-      } catch (paymentErr) {
-        await session.abortTransaction();
-        return res.status(paymentErr.status || 500).json({ success: false, message: paymentErr.message });
-      } finally {
-        await session.endSession();
+      } else if (paymentChanged) {
+        const invoice = order.invoice ? await Invoice.findById(order.invoice).session(session) : null;
+        if (invoice) {
+          const hasApprovedReceipt = await Payment.exists({ invoice: invoice._id, status: "APPROVED" }).session(session);
+          const hasPendingReceipt = await Payment.exists({ invoice: invoice._id, status: "PENDING" }).session(session);
+          if (invoice.paymentStatus === "PAID" || hasApprovedReceipt || hasPendingReceipt) {
+            throw Object.assign(new Error("This order has a paid or pending payment transaction. Resolve it in Finance before changing its payment status."), { status: 409 });
+          }
+          invoice.paymentStatus = "UNPAID";
+          await invoice.save({ session });
+        }
+        order.paymentStatus = paymentStatus;
       }
-    }
 
-    let linkedInvoice = null;
-    if (paymentStatus && order.invoice) {
-      linkedInvoice = await Invoice.findById(order.invoice);
-      const hasApprovedReceipt = linkedInvoice && await Payment.exists({ invoice: linkedInvoice._id, status: "APPROVED" });
-      const hasPendingReceipt = linkedInvoice && await Payment.exists({ invoice: linkedInvoice._id, status: "PENDING" });
-      if ((linkedInvoice?.paymentStatus === "PAID" || hasApprovedReceipt || hasPendingReceipt) && paymentStatus !== "PAID") {
-        return res.status(409).json({
-          success: false,
-          message: "This order has a paid or pending payment transaction. Resolve it in Finance before changing its payment status.",
-        });
-      }
-    }
-
-    if (status) order.status = status;
-    if (paymentStatus) order.paymentStatus = paymentStatus;
-
-    await order.save();
-
-    if (linkedInvoice && paymentStatus) {
-      linkedInvoice.paymentStatus = "UNPAID";
-      await linkedInvoice.save();
-    }
+      if (hasStatus && status !== order.status) order.status = status;
+      if (order.isModified()) await order.save({ session });
+    });
 
     const updatedOrder = await Order.findById(id)
       .populate("parent", "fullName email phone")
@@ -1015,14 +1062,18 @@ exports.updateOrderStatus = async (req, res) => {
 
     return res.status(200).json({
       success: true,
-      message: "Order status updated successfully",
-      data: updatedOrder,
+      message: hasPaymentStatus && paymentStatus === "PAID"
+        ? "Order payment, invoice, and transaction ledger synchronized."
+        : "Order status updated successfully",
+      data: orderWithEffectivePaymentStatus(updatedOrder),
     });
   } catch (err) {
     return res.status(err.statusCode || err.status || (err.name === "CastError" || err.name === "ValidationError" || err instanceof SyntaxError ? 400 : err.name === "VersionError" || err.code === 11000 ? 409 : 500)).json({
       success: false,
       message: err.message,
     });
+  } finally {
+    await session.endSession();
   }
 };
 
