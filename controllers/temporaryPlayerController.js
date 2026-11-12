@@ -36,20 +36,17 @@ const parseArrayField = (value) => {
   }
 };
 
-// Only operator-configured app domains may receive account links.
-const getAppLoginUrl = () => {
-  const candidates = [process.env.PARENT_APP_URL, process.env.FRONTEND_URL, process.env.CLIENT_URL, process.env.APP_URL,
-    ...(process.env.ALLOWED_ORIGINS || "").split(",")];
-  for (const candidate of candidates) {
-    if (!candidate) continue;
-    try {
-      const parsed = new URL(candidate.trim());
-      if (!["http:", "https:"].includes(parsed.protocol) || parsed.username || parsed.password) continue;
-      if (process.env.NODE_ENV === "production" && parsed.protocol !== "https:") continue;
-      return new URL("/signin", parsed.origin).toString();
-    } catch {}
+// A parent link is optional; never substitute the admin frontend or a CORS origin.
+const getParentAppLoginUrl = () => {
+  if (!process.env.PARENT_APP_URL) return null;
+  try {
+    const parsed = new URL(process.env.PARENT_APP_URL.trim());
+    if (!["http:", "https:"].includes(parsed.protocol) || parsed.username || parsed.password) return null;
+    if (process.env.NODE_ENV === "production" && parsed.protocol !== "https:") return null;
+    return new URL("/signin", parsed.origin).toString();
+  } catch {
+    return null;
   }
-  return null;
 };
 
 exports.createTemporaryPlayer = async (req, res) => {
@@ -156,8 +153,7 @@ exports.createTemporaryPlayer = async (req, res) => {
     if (parent?.isBlocked || parent?.status === "REJECTED") throw Object.assign(new Error("This parent account is unavailable; administrator review is required"), { statusCode: 409 });
 
     let isNewAccount = false;
-    const appLoginUrl = getAppLoginUrl();
-
+    const appLoginUrl = getParentAppLoginUrl();
     if (!parent) {
       isNewAccount = true;
       // No reusable credential is emailed or stored in a delivery job. The
@@ -277,21 +273,24 @@ exports.createTemporaryPlayer = async (req, res) => {
 
     let emailQueued = false;
     const emailJobKey = `email:temporary-player-access:${player._id}`;
-    if (appLoginUrl) {
-      await queueEmail(`temporary-player-access:${player._id}`, {
-        to: parent.email,
-        subject: isNewAccount ? "Set up your CoachMax account" : "A temporary player was added to your CoachMax account",
-        html: temporaryPlayerAccessEmail({ parentName: parent.fullName || parentName, playerName: player.fullName, email: parent.email, isNewAccount,
-          loginUrl: isNewAccount ? new URL("/forgot-password?role=PARENT", appLoginUrl).toString() : appLoginUrl }),
-      }, session);
-      emailQueued = true;
-    }
+    await queueEmail(`temporary-player-access:${player._id}`, {
+      to: parent.email,
+      subject: isNewAccount ? "Set up your CoachMax account" : "A temporary player was added to your CoachMax account",
+      html: temporaryPlayerAccessEmail({
+        parentName: parent.fullName || parentName,
+        playerName: player.fullName,
+        email: parent.email,
+        isNewAccount,
+        loginUrl: appLoginUrl ? (isNewAccount ? new URL("/forgot-password?role=PARENT", appLoginUrl).toString() : appLoginUrl) : null,
+      }),
+    }, session);
+    emailQueued = true;
 
     await session.commitTransaction();
     transactionCommitted = true;
     await session.endSession();
 
-    let emailDelivery = { status: appLoginUrl ? "PENDING" : "NOT_CONFIGURED", attempts: 0 };
+    let emailDelivery = { status: "PENDING", attempts: 0 };
     if (emailQueued) {
       try {
         const emailJob = await Notification.collection.findOne({ idempotencyKey: emailJobKey }, { projection: { _id: 1 } });
@@ -325,9 +324,7 @@ exports.createTemporaryPlayer = async (req, res) => {
     let message = contactDetailsReused
       ? `Temporary player created using the existing parent account matched by ${contactMatchedBy}. Its saved email and phone were kept unchanged.`
       : "Temporary player created.";
-    if (!appLoginUrl) {
-      message += " Parent access email was not sent because the parent app URL is not configured.";
-    } else if (emailDelivery.status === "SENT") {
+    if (emailDelivery.status === "SENT") {
       message += ` A welcome email was accepted for delivery to ${parent.email}.`;
     } else if (emailDelivery.status === "PENDING" || emailDelivery.status === "SENDING") {
       message += ` The welcome email is queued for retry${emailDelivery.errorCode ? ` (${emailDelivery.errorCode})` : ""}.`;
