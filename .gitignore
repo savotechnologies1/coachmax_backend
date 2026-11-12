@@ -3,10 +3,8 @@ uploads/
 *.log
 coverage/
 .test-tmp/
-
-.env
-
-
-.env.*
 !.env.example
 /config/serviceAccountKey.json
+config.bat
+.env
+.env.*
