@@ -6,8 +6,9 @@ const Parent = require("../models/Parent");
 const AuditLog = require("../models/AuditLog");
 const Class = require("../models/Class");
 const RegistrationRequest = require("../models/RegistrationRequest");
+const Notification = require("../models/Notification");
 const { temporaryPlayerAccessEmail } = require("../utils/emailTemplates");
-const { queueEmail } = require("../services/deliveryService");
+const { queueEmail, processDeliveryJobById } = require("../services/deliveryService");
 const bcrypt = require("bcryptjs");
 const crypto = require("crypto");
 const mongoose = require("mongoose");
@@ -37,14 +38,18 @@ const parseArrayField = (value) => {
 
 // Only operator-configured app domains may receive account links.
 const getAppLoginUrl = () => {
-  const candidate = process.env.PARENT_APP_URL || process.env.FRONTEND_URL || process.env.CLIENT_URL || process.env.APP_URL;
-  if (!candidate) return null;
-  try {
-    const parsed = new URL(candidate);
-    if (!["http:", "https:"].includes(parsed.protocol) || parsed.username || parsed.password) return null;
-    if (process.env.NODE_ENV === "production" && parsed.protocol !== "https:") return null;
-    return new URL("/signin", parsed.origin).toString();
-  } catch { return null; }
+  const candidates = [process.env.PARENT_APP_URL, process.env.FRONTEND_URL, process.env.CLIENT_URL, process.env.APP_URL,
+    ...(process.env.ALLOWED_ORIGINS || "").split(",")];
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    try {
+      const parsed = new URL(candidate.trim());
+      if (!["http:", "https:"].includes(parsed.protocol) || parsed.username || parsed.password) continue;
+      if (process.env.NODE_ENV === "production" && parsed.protocol !== "https:") continue;
+      return new URL("/signin", parsed.origin).toString();
+    } catch {}
+  }
+  return null;
 };
 
 exports.createTemporaryPlayer = async (req, res) => {
@@ -271,6 +276,7 @@ exports.createTemporaryPlayer = async (req, res) => {
     );
 
     let emailQueued = false;
+    const emailJobKey = `email:temporary-player-access:${player._id}`;
     if (appLoginUrl) {
       await queueEmail(`temporary-player-access:${player._id}`, {
         to: parent.email,
@@ -284,6 +290,19 @@ exports.createTemporaryPlayer = async (req, res) => {
     await session.commitTransaction();
     transactionCommitted = true;
     await session.endSession();
+
+    let emailDelivery = { status: appLoginUrl ? "PENDING" : "NOT_CONFIGURED", attempts: 0 };
+    if (emailQueued) {
+      try {
+        const emailJob = await Notification.collection.findOne({ idempotencyKey: emailJobKey }, { projection: { _id: 1 } });
+        emailDelivery = emailJob
+          ? await processDeliveryJobById(emailJob._id)
+          : { status: "MISSING", attempts: 0 };
+      } catch (emailError) {
+        console.error("Temporary-player welcome email delivery could not be attempted", { code: emailError.code || "EMAIL_DELIVERY_FAILED" });
+        emailDelivery = { status: "PENDING", attempts: 0, errorCode: emailError.code || "EMAIL_DELIVERY_FAILED" };
+      }
+    }
 
     try {
       const { sendNotification } = require("../services/notificationService");
@@ -308,17 +327,21 @@ exports.createTemporaryPlayer = async (req, res) => {
       : "Temporary player created.";
     if (!appLoginUrl) {
       message += " Parent access email was not sent because the parent app URL is not configured.";
-    } else if (emailQueued) {
-      message += isNewAccount ? " A password-setup email was queued for the parent." : " A parent update email was queued.";
+    } else if (emailDelivery.status === "SENT") {
+      message += ` A welcome email was accepted for delivery to ${parent.email}.`;
+    } else if (emailDelivery.status === "PENDING" || emailDelivery.status === "SENDING") {
+      message += ` The welcome email is queued for retry${emailDelivery.errorCode ? ` (${emailDelivery.errorCode})` : ""}.`;
     } else {
-      message += " The player was created, but the parent access email could not be sent.";
+      message += ` The player was created, but welcome email delivery failed${emailDelivery.errorCode ? ` (${emailDelivery.errorCode})` : ""}.`;
     }
 
     res.status(201).json({
       success: true,
       message,
-      emailSent: false,
+      emailSent: emailDelivery.status === "SENT",
       emailQueued,
+      emailDeliveryStatus: emailDelivery.status,
+      emailDeliveryErrorCode: emailDelivery.errorCode || null,
       contactDetailsReused,
       data: {
         player,

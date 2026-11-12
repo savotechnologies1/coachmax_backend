@@ -8,6 +8,7 @@ const Notification = require("../models/Notification");
 const BankDetails = require("../models/BankDetails");
 const PaymentSettings = require("../models/PaymentSettings");
 const { sendNotification } = require("../services/notificationService");
+const { recordAdminPaymentForInvoice, syncPaidInvoiceEffects } = require("../services/adminPaymentService");
 let broadcastSidebarBadges = null;
 try {
   ({ broadcastSidebarBadges } = require("../sockets/chatSocket"));
@@ -24,6 +25,34 @@ const getOrCreatePaymentSettings = async () => {
   return settings;
 };
 exports.getOrCreatePaymentSettings = getOrCreatePaymentSettings;
+
+async function createPendingInvoicePayment({ invoiceId, parentId, paymentMethod, transactionId = "", paymentScreenshot = "", remarks = "" }) {
+  const session = await mongoose.startSession();
+  let payment;
+  try {
+    await session.withTransaction(async () => {
+      const invoice = await Invoice.findOneAndUpdate(
+        { _id: invoiceId, parent: parentId, status: "ACTIVE", paymentStatus: { $nin: ["PAID", "PAYMENT_PENDING"] } },
+        { $set: { paymentMethod, paymentStatus: "PAYMENT_PENDING" } },
+        { new: true, session }
+      );
+      if (!invoice) throw Object.assign(new Error("A payment has already been submitted or this invoice is no longer payable"), { status: 409 });
+      [payment] = await Payment.create([{
+        invoice: invoice._id,
+        parent: parentId,
+        amount: invoice.totalAmount,
+        paymentMethod,
+        transactionId,
+        paymentScreenshot,
+        remarks,
+        status: "PENDING",
+      }], { session });
+    });
+    return payment;
+  } finally {
+    await session.endSession();
+  }
+}
 
 exports.getPaymentSettings = async (req, res) => {
   try {
@@ -124,18 +153,20 @@ exports.payCOD = async (req, res) => {
       });
     }
 
-    const payment = await Payment.create({
-      invoice: invoice._id,
-      parent: parentId,
-      amount: invoice.totalAmount,
+    if (invoice.status !== "ACTIVE") {
+      return res.status(400).json({ success: false, message: "Cannot pay a cancelled invoice" });
+    }
+
+    if (invoice.paymentStatus === "PAYMENT_PENDING" || await Payment.exists({ invoice: invoice._id, status: "PENDING" })) {
+      return res.status(409).json({ success: false, message: "A payment verification is already pending for this invoice" });
+    }
+
+    const payment = await createPendingInvoicePayment({
+      invoiceId: invoice._id,
+      parentId,
       paymentMethod: "COD",
       remarks: remarks || "Parent selected Cash on Delivery (COD)",
-      status: "PENDING",
     });
-
-    invoice.paymentMethod = "COD";
-    invoice.paymentStatus = "PAYMENT_PENDING";
-    await invoice.save();
 
     try {
       await sendNotification({
@@ -160,7 +191,7 @@ exports.payCOD = async (req, res) => {
       data: payment,
     });
   } catch (err) {
-    return res.status(500).json({
+    return res.status(err.status || 500).json({
       success: false,
       message: err.message,
     });
@@ -210,6 +241,10 @@ exports.payOnline = async (req, res) => {
       });
     }
 
+    if (await Payment.exists({ invoice: invoice._id, status: "PENDING" })) {
+      return res.status(409).json({ success: false, message: "A payment verification is already pending for this invoice" });
+    }
+
     if (!req.file) {
       return res.status(400).json({
         success: false,
@@ -226,20 +261,14 @@ exports.payOnline = async (req, res) => {
 
     const paymentScreenshot = `uploads/payment-screenshots/${req.file.filename}`;
 
-    const payment = await Payment.create({
-      invoice: invoice._id,
-      parent: parentId,
-      amount: invoice.totalAmount,
+    const payment = await createPendingInvoicePayment({
+      invoiceId: invoice._id,
+      parentId,
       paymentMethod: "ONLINE",
       transactionId,
       paymentScreenshot,
       remarks,
-      status: "PENDING",
     });
-
-    invoice.paymentMethod = "ONLINE";
-    invoice.paymentStatus = "PAYMENT_PENDING";
-    await invoice.save();
 
     try {
       await sendNotification({
@@ -264,7 +293,7 @@ exports.payOnline = async (req, res) => {
       data: payment,
     });
   } catch (err) {
-    return res.status(500).json({
+    return res.status(err.status || 500).json({
       success: false,
       message: err.message,
     });
@@ -290,6 +319,10 @@ exports.resubmitPayment = async (req, res) => {
         success: false,
         message: "Only rejected payments can be resubmitted",
       });
+    }
+
+    if (await Payment.exists({ invoice: payment.invoice, status: "PENDING", _id: { $ne: payment._id } })) {
+      return res.status(409).json({ success: false, message: "Another payment is already pending for this invoice" });
     }
 
     if (!req.file) {
@@ -513,6 +546,31 @@ exports.getAdminPaymentById = async (req, res) => {
   }
 };
 
+exports.recordAdminInvoicePayment = async (req, res) => {
+  const session = await mongoose.startSession();
+  session.startTransaction();
+  try {
+    const invoice = await Invoice.findById(req.params.id).session(session);
+    if (!invoice) {
+      await session.abortTransaction();
+      return res.status(404).json({ success: false, message: "Invoice not found" });
+    }
+    const result = await recordAdminPaymentForInvoice(invoice, req.admin?._id, session);
+    await session.commitTransaction();
+    if (broadcastSidebarBadges) broadcastSidebarBadges().catch(() => {});
+    return res.status(200).json({
+      success: true,
+      message: result.alreadyPaid ? "Invoice is already settled; no duplicate payment was recorded." : "Payment recorded and approved; invoice and related statuses were updated.",
+      data: { invoiceId: invoice._id, payment: result.payment, alreadyPaid: result.alreadyPaid, zeroAmount: result.zeroAmount },
+    });
+  } catch (err) {
+    await session.abortTransaction();
+    return res.status(err.status || 500).json({ success: false, message: err.message });
+  } finally {
+    await session.endSession();
+  }
+};
+
 exports.approvePayment = async (req, res) => {
   const session = await mongoose.startSession();
   session.startTransaction();
@@ -530,12 +588,12 @@ exports.approvePayment = async (req, res) => {
       });
     }
 
-    if (payment.status === "APPROVED") {
+    if (payment.status !== "PENDING") {
       await session.abortTransaction();
       session.endSession();
-      return res.status(400).json({
+      return res.status(409).json({
         success: false,
-        message: "Payment is already approved",
+        message: payment.status === "APPROVED" ? "Payment is already approved" : "Only pending payments can be approved",
       });
     }
 
@@ -549,6 +607,30 @@ exports.approvePayment = async (req, res) => {
       });
     }
 
+    if (invoice.status !== "ACTIVE") {
+      await session.abortTransaction();
+      session.endSession();
+      return res.status(409).json({ success: false, message: "Cannot approve a payment for a cancelled invoice" });
+    }
+
+    const approvedRows = await Payment.aggregate([
+      { $match: { invoice: invoice._id, status: "APPROVED" } },
+      { $group: { _id: null, total: { $sum: "$amount" } } },
+    ]).session(session);
+    const alreadyReceived = Number(approvedRows[0]?.total || 0);
+    const invoiceTotal = Math.max(0, Number(invoice.totalAmount ?? invoice.amount) || 0);
+    const remaining = Math.max(0, Math.round((invoiceTotal - alreadyReceived) * 100) / 100);
+    if (remaining <= 0 || Math.abs(Number(payment.amount) - remaining) > 0.009) {
+      await session.abortTransaction();
+      session.endSession();
+      return res.status(409).json({
+        success: false,
+        message: remaining <= 0
+          ? "This invoice is already fully paid by another transaction. The duplicate payment was not approved."
+          : `Payment amount must equal the remaining invoice balance of ${remaining.toFixed(2)}.`,
+      });
+    }
+
     payment.status = "APPROVED";
     payment.approvedBy = req.admin ? req.admin._id : null;
     payment.approvedAt = new Date();
@@ -558,76 +640,7 @@ exports.approvePayment = async (req, res) => {
     invoice.verifiedBy = req.admin ? req.admin._id : null;
     invoice.verifiedAt = new Date();
     await invoice.save({ session });
-
-    if (Array.isArray(invoice.players) && invoice.players.length > 0) {
-      if (invoice.class) {
-        const invoiceClassIdStr = invoice.class.toString();
-        const playersToUpdate = await User.find({ _id: { $in: invoice.players } }).session(session);
-        for (const p of playersToUpdate) {
-          p.classPaymentStatuses = p.classPaymentStatuses || [];
-          const existingEntry = p.classPaymentStatuses.find(
-            (cps) => cps.class && cps.class.toString() === invoiceClassIdStr
-          );
-          if (existingEntry) {
-            existingEntry.paymentStatus = "PAID";
-          } else {
-            p.classPaymentStatuses.push({
-              class: invoice.class,
-              paymentStatus: "PAID",
-            });
-          }
-          await p.save({ session });
-        }
-      }
-
-      if (invoice.team && Array.isArray(invoice.players) && invoice.players.length > 0) {
-        const Team = require("../models/Team");
-        const teamDoc = await Team.findById(invoice.team).session(session);
-        if (teamDoc && teamDoc.players) {
-          let modified = false;
-          invoice.players.forEach((pId) => {
-            const pidStr = pId.toString();
-            const pEntry = teamDoc.players.find((item) => {
-              const itemPid = item.player ? item.player.toString() : item.toString();
-              return itemPid === pidStr;
-            });
-            if (pEntry) {
-              pEntry.paymentStatus = "PAID";
-              modified = true;
-            }
-          });
-          if (modified) await teamDoc.save({ session });
-        }
-      }
-    }
-
-    if (invoice.type === "STORE_ORDER") {
-      await Order.updateMany(
-        { invoice: invoice._id },
-        { paymentStatus: "PAID" },
-        { session }
-      );
-    }
-
-    // Holiday Camp or Event Fee: sync EventRegistration paymentStatus
-    if (invoice.event || invoice.eventRegistration || invoice.type === "CAMP_FEE" || invoice.type === "TOURNAMENT_FEE") {
-      const EventRegistration = require("../models/EventRegistration");
-      const filter = invoice.eventRegistration
-        ? { _id: invoice.eventRegistration }
-        : { invoice: invoice._id };
-      const registrations = await EventRegistration.find(filter).session(session);
-      for (const registration of registrations) {
-        if (registration.status !== "REGISTERED") continue;
-        const outstanding = await Invoice.exists({
-          $or: [{ eventRegistration: registration._id }, { _id: registration.invoice }],
-          status: "ACTIVE",
-          paymentStatus: { $ne: "PAID" },
-          totalAmount: { $gt: 0 },
-        }).session(session);
-        registration.paymentStatus = outstanding ? "UNPAID" : "PAID";
-        await registration.save({ session });
-      }
-    }
+    await syncPaidInvoiceEffects(invoice, session);
 
     await session.commitTransaction();
     session.endSession();
@@ -675,30 +688,52 @@ exports.rejectPayment = async (req, res) => {
     const { id } = req.params;
     const { reason = "Payment proof invalid" } = req.body;
 
-    const payment = await Payment.findById(id);
-    if (!payment) {
-      return res.status(404).json({
-        success: false,
-        message: "Payment record not found",
-      });
+    const session = await mongoose.startSession();
+    session.startTransaction();
+    let payment;
+    let invoice;
+    try {
+      payment = await Payment.findById(id).session(session);
+      if (!payment) {
+        await session.abortTransaction();
+        return res.status(404).json({ success: false, message: "Payment record not found" });
+      }
+
+      if (payment.status !== "PENDING") {
+        await session.abortTransaction();
+        return res.status(400).json({
+          success: false,
+          message: payment.status === "APPROVED" ? "Cannot reject an already approved payment" : "Only pending payments can be rejected",
+        });
+      }
+
+      payment.status = "REJECTED";
+      payment.rejectionReason = reason;
+      await payment.save({ session });
+
+      invoice = await Invoice.findById(payment.invoice).session(session);
+      if (invoice) {
+        const approvedRows = await Payment.aggregate([
+          { $match: { invoice: invoice._id, status: "APPROVED" } },
+          { $group: { _id: null, total: { $sum: "$amount" } } },
+        ]).session(session);
+        const approvedTotal = Number(approvedRows[0]?.total || 0);
+        const invoiceTotal = Math.max(0, Number(invoice.totalAmount ?? invoice.amount) || 0);
+        const otherPending = await Payment.exists({ invoice: invoice._id, status: "PENDING" }).session(session);
+        invoice.paymentStatus = invoiceTotal <= 0 || approvedTotal >= invoiceTotal - 0.009
+          ? "PAID"
+          : otherPending ? "PAYMENT_PENDING" : "UNPAID";
+        await invoice.save({ session });
+        if (invoice.paymentStatus === "PAID") await syncPaidInvoiceEffects(invoice, session);
+      }
+      await session.commitTransaction();
+    } catch (transactionError) {
+      await session.abortTransaction();
+      throw transactionError;
+    } finally {
+      await session.endSession();
     }
 
-    if (payment.status === "APPROVED") {
-      return res.status(400).json({
-        success: false,
-        message: "Cannot reject an already approved payment",
-      });
-    }
-
-    payment.status = "REJECTED";
-    payment.rejectionReason = reason;
-    await payment.save();
-
-    const invoice = await Invoice.findById(payment.invoice);
-    if (invoice) {
-      invoice.paymentStatus = "REJECTED";
-      await invoice.save();
-    }
     try {
       await sendNotification({
         recipientType: "PARENT",
@@ -744,19 +779,19 @@ exports.getPaymentDashboardStats = async (req, res) => {
     startOfMonth.setHours(0, 0, 0, 0);
 
     const [
-      totalInvoices,
-      pendingInvoices,
-      paidInvoices,
+      activeInvoices,
+      approvedByInvoiceRows,
       pendingPayments,
       rejectedPayments,
       todaysPayments,
       monthlyPayments,
-      storeSalesInvoices,
-      unpaidInvoicesSum,
+      storeSalesReceipts,
     ] = await Promise.all([
-      Invoice.countDocuments({ status: "ACTIVE" }),
-      Invoice.countDocuments({ status: "ACTIVE", paymentStatus: { $ne: "PAID" } }),
-      Invoice.countDocuments({ status: "ACTIVE", paymentStatus: "PAID" }),
+      Invoice.find({ status: "ACTIVE" }).select("_id totalAmount amount type").lean(),
+      Payment.aggregate([
+        { $match: { status: "APPROVED" } },
+        { $group: { _id: "$invoice", total: { $sum: "$amount" } } },
+      ]),
       Payment.countDocuments({ status: "PENDING" }),
       Payment.countDocuments({ status: "REJECTED" }),
       Payment.aggregate([
@@ -767,41 +802,26 @@ exports.getPaymentDashboardStats = async (req, res) => {
         { $match: { status: "APPROVED", approvedAt: { $gte: startOfMonth } } },
         { $group: { _id: null, total: { $sum: "$amount" } } },
       ]),
-      Invoice.aggregate([
-        { $match: { status: "ACTIVE", type: "STORE_ORDER", paymentStatus: "PAID" } },
-        {
-          $group: {
-            _id: null,
-            total: {
-              $sum: {
-                $cond: [
-                  { $gt: ["$totalAmount", 0] },
-                  "$totalAmount",
-                  { $ifNull: ["$amount", 0] },
-                ],
-              },
-            },
-          },
-        },
-      ]),
-      Invoice.aggregate([
-        { $match: { status: "ACTIVE", paymentStatus: { $ne: "PAID" } } },
-        {
-          $group: {
-            _id: null,
-            total: {
-              $sum: {
-                $cond: [
-                  { $gt: ["$totalAmount", 0] },
-                  "$totalAmount",
-                  { $ifNull: ["$amount", 0] },
-                ],
-              },
-            },
-          },
-        },
+      Payment.aggregate([
+        { $match: { status: "APPROVED" } },
+        { $lookup: { from: Invoice.collection.name, localField: "invoice", foreignField: "_id", as: "invoice" } },
+        { $unwind: "$invoice" },
+        { $match: { "invoice.status": "ACTIVE", "invoice.type": "STORE_ORDER" } },
+        { $group: { _id: null, total: { $sum: "$amount" } } },
       ]),
     ]);
+
+    const approvedByInvoice = new Map(approvedByInvoiceRows.map((row) => [String(row._id), Number(row.total) || 0]));
+    const paidInvoices = activeInvoices.filter((invoice) => {
+      const due = Math.max(0, Number(invoice.totalAmount ?? invoice.amount) || 0);
+      return due === 0 || (approvedByInvoice.get(String(invoice._id)) || 0) >= due - 0.009;
+    }).length;
+    const totalInvoices = activeInvoices.length;
+    const pendingInvoices = Math.max(0, totalInvoices - paidInvoices);
+    const outstandingAmount = activeInvoices.reduce((sum, invoice) => {
+      const due = Math.max(0, Number(invoice.totalAmount ?? invoice.amount) || 0);
+      return sum + Math.max(0, due - (approvedByInvoice.get(String(invoice._id)) || 0));
+    }, 0);
 
     const stats = {
       totalInvoices,
@@ -811,8 +831,8 @@ exports.getPaymentDashboardStats = async (req, res) => {
       rejectedPayments,
       todaysCollections: todaysPayments.length > 0 ? todaysPayments[0].total : 0,
       monthlyCollections: monthlyPayments.length > 0 ? monthlyPayments[0].total : 0,
-      storeSales: storeSalesInvoices.length > 0 ? storeSalesInvoices[0].total : 0,
-      outstandingAmount: unpaidInvoicesSum.length > 0 ? unpaidInvoicesSum[0].total : 0,
+      storeSales: storeSalesReceipts.length > 0 ? storeSalesReceipts[0].total : 0,
+      outstandingAmount,
     };
 
     return res.status(200).json({

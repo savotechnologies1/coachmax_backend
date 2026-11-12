@@ -3,10 +3,12 @@ const ProductCategory = require("../models/ProductCategory");
 const Cart = require("../models/Cart");
 const Order = require("../models/Order");
 const Invoice = require("../models/Invoice");
+const Payment = require("../models/Payment");
 const Parent = require("../models/Parent");
 const mongoose = require("mongoose");
 const { checkout: checkoutOrder } = require("../services/checkoutService");
 const { currencyAmount } = require("../utils/money");
+const { recordAdminPaymentForInvoice } = require("../services/adminPaymentService");
 let broadcastSidebarBadges = null;
 try {
   ({ broadcastSidebarBadges } = require("../sockets/chatSocket"));
@@ -960,10 +962,48 @@ exports.updateOrderStatus = async (req, res) => {
       });
     }
 
+    if (paymentStatus === "PAID") {
+      const session = await mongoose.startSession();
+      session.startTransaction();
+      try {
+        const txOrder = await Order.findById(id).session(session);
+        const invoice = txOrder?.invoice ? await Invoice.findById(txOrder.invoice).session(session) : null;
+        if (!invoice) throw Object.assign(new Error("This order has no invoice. Create or reconcile its invoice before recording payment."), { status: 409 });
+        await recordAdminPaymentForInvoice(invoice, req.admin?._id, session);
+        await session.commitTransaction();
+        const updatedOrder = await Order.findById(id).populate("parent", "fullName email phone").populate("invoice");
+        if (broadcastSidebarBadges) broadcastSidebarBadges().catch(() => {});
+        return res.status(200).json({ success: true, message: "Order payment, invoice, and transaction ledger synchronized.", data: updatedOrder });
+      } catch (paymentErr) {
+        await session.abortTransaction();
+        return res.status(paymentErr.status || 500).json({ success: false, message: paymentErr.message });
+      } finally {
+        await session.endSession();
+      }
+    }
+
+    let linkedInvoice = null;
+    if (paymentStatus && order.invoice) {
+      linkedInvoice = await Invoice.findById(order.invoice);
+      const hasApprovedReceipt = linkedInvoice && await Payment.exists({ invoice: linkedInvoice._id, status: "APPROVED" });
+      const hasPendingReceipt = linkedInvoice && await Payment.exists({ invoice: linkedInvoice._id, status: "PENDING" });
+      if ((linkedInvoice?.paymentStatus === "PAID" || hasApprovedReceipt || hasPendingReceipt) && paymentStatus !== "PAID") {
+        return res.status(409).json({
+          success: false,
+          message: "This order has a paid or pending payment transaction. Resolve it in Finance before changing its payment status.",
+        });
+      }
+    }
+
     if (status) order.status = status;
     if (paymentStatus) order.paymentStatus = paymentStatus;
 
     await order.save();
+
+    if (linkedInvoice && paymentStatus) {
+      linkedInvoice.paymentStatus = "UNPAID";
+      await linkedInvoice.save();
+    }
 
     const updatedOrder = await Order.findById(id)
       .populate("parent", "fullName email phone")

@@ -91,6 +91,7 @@ const {
   getEmailCampaigns,
   getEmailCampaignDetails,
   retryFailedEmailRecipients,
+  sendTestEmail,
 } = require("../controllers/emailCampaignController");
 
 const {
@@ -189,6 +190,7 @@ const {
   getAdminPayments,
   getAdminPaymentById,
   approvePayment,
+  recordAdminInvoicePayment,
   rejectPayment,
   getPaymentDashboardStats,
   getPaymentSettings,
@@ -472,6 +474,7 @@ router.get("/invoices", auth, isAdmin, getAdminInvoices);
 router.get("/invoices/:id", auth, isAdmin, getAdminInvoiceById);
 router.patch("/invoices/:id", auth, isAdmin, updateInvoice);
 router.put("/invoices/:id", auth, isAdmin, updateInvoice);
+router.post("/invoices/:id/record-payment", auth, isAdmin, recordAdminInvoicePayment);
 router.delete("/invoices/:id", auth, isAdmin, deleteInvoice);
 
 
@@ -552,6 +555,7 @@ router.get("/chat/conversations", auth, isAdmin, getAllConversations);
 router.get("/email-campaigns/audiences", auth, isAdmin, getEmailAudiences);
 router.get("/email-campaigns/recipients", auth, isAdmin, getEmailAudiencePlayers);
 router.post("/email-campaigns/preview", auth, isAdmin, previewEmailCampaign);
+router.post("/email-campaigns/test", auth, isAdmin, sendTestEmail);
 router.post("/email-campaigns", auth, isAdmin, createEmailCampaign);
 router.get("/email-campaigns", auth, isAdmin, getEmailCampaigns);
 router.get("/email-campaigns/:campaignId", auth, isAdmin, getEmailCampaignDetails);

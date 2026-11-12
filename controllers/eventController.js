@@ -7,6 +7,7 @@ const CampSession = require("../models/CampSession");
 const Attendance = require("../models/Attendance");
 const Invoice = require("../models/Invoice");
 const Payment = require("../models/Payment");
+const { recordAdminPaymentForInvoice } = require("../services/adminPaymentService");
 const Parent = require("../models/Parent");
 const Term = require("../models/Term");
 const { generateInvoiceNumber } = require("./invoiceController");
@@ -2254,10 +2255,25 @@ exports.updateEventRegistrationSessions = async (req, res) => {
       const newTotalCents = selected.reduce((sum, item) => sum + campAmountInCents(item.fee), 0);
       const oldTotal = Number(registration.totalAmount || 0);
       const invoices = await getRegistrationInvoices(registration, transaction);
-      const paidInvoices = invoices.filter((invoice) => invoice.paymentStatus === "PAID");
-      const paidCents = paidInvoices.reduce((sum, invoice) => sum + campAmountInCents(invoice.totalAmount), 0);
+      const approvedRows = invoices.length ? await Payment.aggregate([
+        { $match: { invoice: { $in: invoices.map((invoice) => invoice._id) }, status: "APPROVED" } },
+        { $group: { _id: "$invoice", total: { $sum: "$amount" } } },
+      ]).session(transaction) : [];
+      const approvedByInvoice = new Map(approvedRows.map((row) => [String(row._id), Number(row.total) || 0]));
+      const paidInvoices = invoices.filter((invoice) => {
+        const amount = Math.max(0, Number(invoice.totalAmount ?? invoice.amount) || 0);
+        return amount === 0 || (approvedByInvoice.get(String(invoice._id)) || 0) >= amount - 0.009;
+      });
+      const paidCents = paidInvoices.reduce((sum, invoice) => {
+        const amount = Math.max(0, Number(invoice.totalAmount ?? invoice.amount) || 0);
+        return sum + Math.min(campAmountInCents(amount), campAmountInCents(approvedByInvoice.get(String(invoice._id)) || 0));
+      }, 0);
       const amountDue = Math.max(0, newTotalCents - paidCents) / 100;
-      const activeUnpaid = invoices.filter((invoice) => invoice.status === "ACTIVE" && invoice.paymentStatus !== "PAID");
+      const activeUnpaid = invoices.filter((invoice) => {
+        if (invoice.status !== "ACTIVE") return false;
+        const amount = Math.max(0, Number(invoice.totalAmount ?? invoice.amount) || 0);
+        return amount > 0 && (approvedByInvoice.get(String(invoice._id)) || 0) < amount - 0.009;
+      });
       if (activeUnpaid.some((invoice) => invoice.paymentStatus === "PAYMENT_PENDING")) {
         fail(409, "A payment is pending for this registration. Resolve it before changing sessions.");
       }
@@ -2397,13 +2413,38 @@ exports.updateEventRegistrationPaymentStatus = async (req, res) => {
       return res.status(404).json({ success: false, message: "Registration not found" });
     }
 
+    if (paymentStatus === "PAID") {
+      const session = await mongoose.startSession();
+      session.startTransaction();
+      try {
+        const txRegistration = await EventRegistration.findById(registration._id).session(session);
+        const invoice = txRegistration.invoice ? await Invoice.findById(txRegistration.invoice).session(session) : null;
+        if (invoice) {
+          await recordAdminPaymentForInvoice(invoice, req.admin?._id, session);
+        } else if (Number(txRegistration.totalAmount || 0) === 0) {
+          txRegistration.paymentStatus = "PAID";
+          await txRegistration.save({ session });
+        } else {
+          throw Object.assign(new Error("This registration has a balance but no invoice. Create or reconcile its invoice before recording payment."), { status: 409 });
+        }
+        await session.commitTransaction();
+        return res.json({ success: true, message: "Camp payment and invoice status synchronized.", data: txRegistration });
+      } catch (paymentErr) {
+        await session.abortTransaction();
+        return res.status(paymentErr.status || 500).json({ success: false, message: paymentErr.message });
+      } finally {
+        await session.endSession();
+      }
+    }
+
     const linkedInvoice = registration.invoice ? await Invoice.findById(registration.invoice) : null;
-    if (linkedInvoice?.paymentStatus === "PAID" && paymentStatus !== "PAID") {
-      return res.status(409).json({ success: false, message: "A paid invoice cannot be changed here. Handle payment corrections separately." });
+    const hasApprovedReceipt = linkedInvoice && await Payment.exists({ invoice: linkedInvoice._id, status: "APPROVED" });
+    const hasPendingReceipt = linkedInvoice && await Payment.exists({ invoice: linkedInvoice._id, status: "PENDING" });
+    if ((linkedInvoice?.paymentStatus === "PAID" || hasApprovedReceipt || hasPendingReceipt) && paymentStatus !== "PAID") {
+      return res.status(409).json({ success: false, message: "This registration has a paid or pending payment transaction. Resolve it in Finance before changing its status." });
     }
     if (linkedInvoice) {
-      const invoiceStatus = paymentStatus === "PAID" ? "PAID" : "UNPAID";
-      linkedInvoice.paymentStatus = invoiceStatus;
+      linkedInvoice.paymentStatus = "UNPAID";
       await linkedInvoice.save();
     }
     registration.paymentStatus = paymentStatus;

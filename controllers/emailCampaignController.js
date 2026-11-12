@@ -8,9 +8,11 @@ const User = require("../models/User");
 const EmailCampaign = require("../models/EmailCampaign");
 const EmailCampaignRecipient = require("../models/EmailCampaignRecipient");
 const { queueEmail } = require("../services/deliveryService");
+const { sendTestEmail: deliverTestEmail } = require("../utils/sendEmail");
 
 const TYPES = new Set(["CLASS", "EVENT", "TOURNAMENT"]);
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const lastEmailTestByAdmin = new Map();
 const idString = (value) => String(value?._id || value || "");
 const isObjectId = (value) => mongoose.Types.ObjectId.isValid(String(value || ""));
 const escapeHtml = (value = "") => String(value).replace(/[&<>"']/g, (character) => ({
@@ -174,6 +176,57 @@ exports.getEmailAudiences = async (_req, res) => {
   } catch (error) {
     console.error("getEmailAudiences failed", error.message);
     res.status(500).json({ success: false, message: "Could not load email audiences." });
+  }
+};
+
+exports.sendTestEmail = async (req, res) => {
+  const email = String(req.body?.email || "").trim().toLowerCase();
+  if (!email || email.length > 254 || !EMAIL_PATTERN.test(email)) {
+    return res.status(400).json({ success: false, message: "Enter a valid test email address." });
+  }
+
+  const adminId = String(req.admin?._id || "");
+  if (!adminId) return res.status(401).json({ success: false, message: "An admin session is required." });
+  const now = Date.now();
+  for (const [key, timestamp] of lastEmailTestByAdmin) {
+    if (now - timestamp >= 60000) lastEmailTestByAdmin.delete(key);
+  }
+  const previousTest = lastEmailTestByAdmin.get(adminId);
+  if (previousTest && now - previousTest < 30000) {
+    const retryAfterSeconds = Math.ceil((30000 - (now - previousTest)) / 1000);
+    return res.status(429).json({ success: false, message: `Please wait ${retryAfterSeconds} seconds before sending another test email.` });
+  }
+
+  lastEmailTestByAdmin.set(adminId, now);
+  try {
+    const result = await deliverTestEmail(email);
+    return res.json({
+      success: true,
+      message: `Test email accepted by the mail server for ${email}. Check the inbox and spam folder.`,
+      data: { recipient: email, messageId: result.messageId },
+    });
+  } catch (error) {
+    console.error("sendTestEmail failed", { code: error.code || "SMTP_ERROR", responseCode: error.responseCode || null });
+    const code = String(error.code || "").toUpperCase();
+    const responseCode = Number(error.responseCode || 0);
+    let message = "The mail server could not accept the test email. Check the email service settings and try again.";
+    let status = 502;
+    if (code === "EMAIL_NOT_CONFIGURED") {
+      message = "Email is not configured. Set EMAIL_USER and EMAIL_PASS in the backend environment.";
+      status = 503;
+    } else if (code === "EMAIL_INVALID_PORT") {
+      message = "The configured EMAIL_PORT is invalid. Use a port between 1 and 65535.";
+      status = 503;
+    } else if (code === "EAUTH" || responseCode === 535) {
+      message = "SMTP authentication failed. Check EMAIL_USER and EMAIL_PASS; Gmail accounts need an app password.";
+      status = 502;
+    } else if (["ECONNECTION", "ETIMEDOUT", "ESOCKET", "ECONNREFUSED", "EDNS"].includes(code)) {
+      message = "Could not connect to the email server. Check EMAIL_HOST and EMAIL_PORT.";
+      status = 502;
+    } else if (responseCode >= 500) {
+      message = "The email server rejected this test message. Check the sender and recipient settings.";
+    }
+    return res.status(status).json({ success: false, message });
   }
 };
 

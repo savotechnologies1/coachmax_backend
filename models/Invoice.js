@@ -47,6 +47,13 @@ const invoiceSchema = new mongoose.Schema(
       type: Number,
       default: 0,
     },
+    // Signed admin-only delta from subtotal - discount (negative means a discount).
+    // The reason for each change is kept in the audit log, not on the parent-facing invoice.
+    adminAdjustmentAmount: {
+      type: Number,
+      default: 0,
+      select: false,
+    },
     totalAmount: {
       type: Number,
       required: true,
@@ -95,7 +102,7 @@ const invoiceSchema = new mongoose.Schema(
     },
     paymentMethod: {
       type: String,
-      enum: ["ONLINE", "COD", null],
+      enum: ["ONLINE", "COD", "ADMIN_MANUAL", null],
       default: null,
     },
     paymentStatus: {

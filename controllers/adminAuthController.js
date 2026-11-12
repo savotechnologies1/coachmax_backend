@@ -35,6 +35,7 @@ const Message = require("../models/Message");
 const AuditLog = require("../models/AuditLog");
 const { tokenHash, isActiveToken, clientIp, deviceInfo } = require("../utils/sessionInfo");
 const { generateClassInvoice, generateTransferInvoice, generateTeamInvoice, generateLeagueInvoice } = require("../services/invoiceService");
+const { recordAdminPaymentForInvoice } = require("../services/adminPaymentService");
 const {
   normalizePaymentStatus,
   comparePlayersByPaymentStatus,
@@ -848,6 +849,103 @@ exports.updatePaymentStatus = async (req, res) => {
       });
     }
 
+    // Selecting PAID is an administrative receipt action: issue/reuse the
+    // charge, record (or approve an existing matching) transaction, and sync
+    // enrollment status in one MongoDB transaction.
+    if (paymentStatus === "PAID") {
+      const session = await mongoose.startSession();
+      session.startTransaction();
+      try {
+        const txUser = await User.findById(userId).session(session);
+        let resultCount = 0;
+
+        if (teamId) {
+          const teamDoc = await Team.findById(teamId).session(session);
+          if (!teamDoc) throw Object.assign(new Error("Team not found"), { status: 404 });
+
+          if (leagueId) {
+            if (!mongoose.Types.ObjectId.isValid(leagueId)) throw Object.assign(new Error("Invalid League ID format"), { status: 400 });
+            let leagueEntry = (teamDoc.leagues || []).find((entry) => String(entry.league?._id || entry.league) === String(leagueId));
+            if (!leagueEntry) {
+              const league = await League.findById(leagueId).session(session);
+              if (!league) throw Object.assign(new Error("League not found"), { status: 404 });
+              teamDoc.leagues = teamDoc.leagues || [];
+              teamDoc.leagues.push({ league: leagueId, teamFee: Number(league.fee || 0), status: "ACTIVE", enrolledAt: new Date(), players: [] });
+              leagueEntry = teamDoc.leagues[teamDoc.leagues.length - 1];
+            }
+            leagueEntry.players = leagueEntry.players || [];
+            let playerEntry = leagueEntry.players.find((entry) => String(entry.player?._id || entry.player) === String(userId));
+            if (!playerEntry) {
+              leagueEntry.players.push({ player: userId, paymentStatus: "PAID", status: "ACTIVE" });
+              playerEntry = leagueEntry.players[leagueEntry.players.length - 1];
+            } else playerEntry.paymentStatus = "PAID";
+
+            await teamDoc.save({ session });
+
+            const fee = Number(leagueEntry.teamFee || 0);
+            if (fee > 0) {
+              const issued = await generateLeagueInvoice({ userId, leagueId, teamId, amount: fee, session });
+              if (issued.invoice) {
+                await recordAdminPaymentForInvoice(issued.invoice, req.admin?._id, session);
+                resultCount++;
+              }
+            }
+          } else {
+            teamDoc.players = teamDoc.players || [];
+            let playerEntry = teamDoc.players.find((entry) => String(entry.player?._id || entry.player || entry) === String(userId));
+            if (!playerEntry) {
+              teamDoc.players.push({ player: userId, paymentStatus: "PAID" });
+              playerEntry = teamDoc.players[teamDoc.players.length - 1];
+            } else if (playerEntry.player) playerEntry.paymentStatus = "PAID";
+
+            await teamDoc.save({ session });
+
+            if (Number(teamDoc.teamFee || 0) > 0) {
+              const issued = await generateTeamInvoice({ userId, teamId, session });
+              if (issued.invoice) {
+                await recordAdminPaymentForInvoice(issued.invoice, req.admin?._id, session);
+                resultCount++;
+              }
+            }
+          }
+        } else {
+          txUser.classPaymentStatuses = txUser.classPaymentStatuses || [];
+          const classIds = classId ? [classId.toString()] : (txUser.assignedClasses || []).map((id) => id.toString());
+          for (const cid of classIds) {
+            const entry = txUser.classPaymentStatuses.find((item) => String(item.class?._id || item.class) === String(cid));
+            if (entry) entry.paymentStatus = "PAID";
+            else txUser.classPaymentStatuses.push({ class: cid, paymentStatus: "PAID" });
+          }
+          const allClassStatuses = txUser.classPaymentStatuses.map((entry) => entry.paymentStatus);
+          if (allClassStatuses.some((status) => status === "OVER_DUE")) txUser.paymentStatus = "OVER_DUE";
+          else if (allClassStatuses.some((status) => status === "UNPAID")) txUser.paymentStatus = "UNPAID";
+          else if (allClassStatuses.length && allClassStatuses.every((status) => status === "PAID")) txUser.paymentStatus = "PAID";
+          else if (allClassStatuses.some((status) => status === "TRIAL")) txUser.paymentStatus = "TRIAL";
+          else txUser.paymentStatus = paymentStatus;
+          await txUser.save({ session });
+          for (const cid of classIds) {
+            const issued = await generateClassInvoice({ userId: txUser._id, classId: cid, session });
+            if (issued.invoice) {
+              await recordAdminPaymentForInvoice(issued.invoice, req.admin?._id, session);
+              resultCount++;
+            }
+          }
+        }
+
+        await session.commitTransaction();
+        return res.status(200).json({
+          success: true,
+          message: "Paid status recorded with invoice and payment ledger synchronized. Existing matching pending payments were approved without creating duplicates.",
+          data: { playerId: userId, invoicesSettled: resultCount },
+        });
+      } catch (paymentErr) {
+        await session.abortTransaction();
+        return res.status(paymentErr.status || 500).json({ success: false, message: paymentErr.message });
+      } finally {
+        await session.endSession();
+      }
+    }
+
     /*
     |--------------------------------------------------------------------------
     | TEAM + LEAGUE PAYMENT STATUS
@@ -865,6 +963,33 @@ exports.updatePaymentStatus = async (req, res) => {
         return res.status(404).json({
           success: false,
           message: "Team not found",
+        });
+      }
+
+      if (leagueId && !mongoose.Types.ObjectId.isValid(leagueId)) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid League ID format",
+        });
+      }
+
+      const teamInvoiceQuery = {
+        players: user._id,
+        team: teamDoc._id,
+        status: "ACTIVE",
+        league: leagueId || null,
+      };
+      const hasPaidTeamInvoice = await Invoice.exists({
+        ...teamInvoiceQuery,
+        paymentStatus: "PAID",
+      });
+      const teamInvoiceIds = await Invoice.find(teamInvoiceQuery).distinct("_id");
+      const hasApprovedTeamReceipt = teamInvoiceIds.length > 0 && await Payment.exists({ invoice: { $in: teamInvoiceIds }, status: "APPROVED" });
+      const hasPendingTeamReceipt = teamInvoiceIds.length > 0 && await Payment.exists({ invoice: { $in: teamInvoiceIds }, status: "PENDING" });
+      if ((hasPaidTeamInvoice || hasApprovedTeamReceipt || hasPendingTeamReceipt) && paymentStatus !== "PAID") {
+        return res.status(409).json({
+          success: false,
+          message: "This item has a paid or pending payment transaction. Resolve it in Finance before changing its enrollment status.",
         });
       }
 
@@ -1035,6 +1160,10 @@ exports.updatePaymentStatus = async (req, res) => {
 
         await teamDoc.save();
       }
+
+      await Invoice.updateMany(teamInvoiceQuery, {
+        $set: { paymentStatus: paymentStatus === "PAID" ? "PAID" : "UNPAID" },
+      });
     }
 
     /*
@@ -1052,6 +1181,25 @@ exports.updatePaymentStatus = async (req, res) => {
         : (user.assignedClasses || []).map((id) =>
           id.toString()
         );
+
+      const classInvoiceQuery = {
+        players: user._id,
+        class: { $in: targetClassIds },
+        status: "ACTIVE",
+      };
+      const hasPaidClassInvoice = targetClassIds.length > 0 && await Invoice.exists({
+        ...classInvoiceQuery,
+        paymentStatus: "PAID",
+      });
+      const classInvoiceIds = targetClassIds.length > 0 ? await Invoice.find(classInvoiceQuery).distinct("_id") : [];
+      const hasApprovedClassReceipt = classInvoiceIds.length > 0 && await Payment.exists({ invoice: { $in: classInvoiceIds }, status: "APPROVED" });
+      const hasPendingClassReceipt = classInvoiceIds.length > 0 && await Payment.exists({ invoice: { $in: classInvoiceIds }, status: "PENDING" });
+      if ((hasPaidClassInvoice || hasApprovedClassReceipt || hasPendingClassReceipt) && paymentStatus !== "PAID") {
+        return res.status(409).json({
+          success: false,
+          message: "This item has a paid or pending payment transaction. Resolve it in Finance before changing its enrollment status.",
+        });
+      }
 
       if (targetClassIds.length > 0) {
         for (const cidStr of targetClassIds) {
@@ -1096,23 +1244,11 @@ exports.updatePaymentStatus = async (req, res) => {
         }
       }
 
-      // Synchronize matching ACTIVE invoices if set to PAID
-      if (paymentStatus === "PAID") {
-        try {
-          const InvoiceModel = require("../models/Invoice");
-          const invQuery = {
-            players: user._id,
-            status: "ACTIVE",
-          };
-          if (classId) {
-            invQuery.class = classId;
-          }
-          await InvoiceModel.updateMany(invQuery, {
-            $set: { paymentStatus: "PAID" },
-          });
-        } catch (e) {
-          console.error("Error updating invoice to PAID:", e.message);
-        }
+      // Keep the selected class status and its active invoice in sync.
+      if (targetClassIds.length > 0) {
+        await Invoice.updateMany(classInvoiceQuery, {
+          $set: { paymentStatus: paymentStatus === "PAID" ? "PAID" : "UNPAID" },
+        });
       }
 
       await user.save();
@@ -1157,6 +1293,13 @@ exports.updatePaymentStatus = async (req, res) => {
           }
         }
 
+        else if (teamId) {
+          await generateTeamInvoice({
+            userId: user._id,
+            teamId,
+          });
+        }
+
         /*
         |--------------------------------------------------------------------------
         | CLASS INVOICE
@@ -1193,6 +1336,10 @@ exports.updatePaymentStatus = async (req, res) => {
           "Auto invoice generation error in updatePaymentStatus:",
           invErr.message
         );
+        return res.status(invErr.status || 500).json({
+          success: false,
+          message: `Payment status was updated, but its invoice could not be generated. Retry the update after correcting the billing issue. ${invErr.message}`,
+        });
       }
     }
 
@@ -1213,7 +1360,7 @@ exports.updatePaymentStatus = async (req, res) => {
       err
     );
 
-    return res.status(500).json({
+    return res.status(err.status || 500).json({
       success: false,
       message: err.message,
     });
@@ -4813,8 +4960,8 @@ exports.getPlayerDetails = async (req, res) => {
       if (!invoice) return { received: 0, pending: 0, awaitingApproval: 0, discount: 0 };
       const amount = Number(invoice.totalAmount ?? invoice.amount ?? 0);
       const receipt = invoiceReceipts.get(invoice._id.toString()) || { received: 0, awaitingApproval: 0 };
-      const received = receipt.received > 0 ? Math.min(receipt.received, amount) : invoice.paymentStatus === "PAID" ? amount : 0;
-      const remaining = Math.max(0, amount - received);
+      const received = receipt.received;
+      const remaining = Math.max(0, amount - Math.min(received, amount));
       const awaitingApproval = Math.min(remaining, receipt.awaitingApproval);
       const pending = Math.max(0, remaining - awaitingApproval);
       return { received, pending, awaitingApproval, discount: Number(invoice.discount) || 0 };
@@ -4863,10 +5010,10 @@ exports.getPlayerDetails = async (req, res) => {
         ? matchingInvoice.totalAmount
         : classPrice;
       const invoiceAmounts = getInvoiceAmounts(matchingInvoice);
-      const amountReceived = matchingInvoice ? invoiceAmounts.received : stUpper === "PAID" ? fee : 0;
-      const amountPending = matchingInvoice ? invoiceAmounts.pending : ["UNPAID", "OVER_DUE"].includes(stUpper) ? fee : 0;
+      const amountReceived = matchingInvoice ? invoiceAmounts.received : 0;
+      const amountPending = matchingInvoice ? invoiceAmounts.pending : (["UNPAID", "OVER_DUE"].includes(stUpper) || stUpper === "PAID") ? fee : 0;
 
-      const effectiveStatus = stUpper === "PAID" || matchingInvoice?.paymentStatus === "PAID" ? "PAID" : stUpper;
+      const effectiveStatus = fee <= 0 ? stUpper : invoiceAmounts.received >= fee ? "PAID" : invoiceAmounts.awaitingApproval > 0 ? "PAYMENT_PENDING" : stUpper === "PAID" ? "UNPAID" : stUpper;
 
       return {
         classId: cls._id,
@@ -4944,10 +5091,10 @@ exports.getPlayerDetails = async (req, res) => {
         : teamFee;
 
       const invoiceAmounts = getInvoiceAmounts(matchingInvoice);
-      const amountReceived = matchingInvoice ? invoiceAmounts.received : rawStatus === "PAID" ? fee : 0;
-      const amountPending = matchingInvoice ? invoiceAmounts.pending : ["UNPAID", "OVER_DUE"].includes(rawStatus) ? fee : 0;
+      const amountReceived = matchingInvoice ? invoiceAmounts.received : 0;
+      const amountPending = matchingInvoice ? invoiceAmounts.pending : (["UNPAID", "OVER_DUE"].includes(rawStatus) || rawStatus === "PAID") ? fee : 0;
 
-      const effectiveStatus = rawStatus === "PAID" || matchingInvoice?.paymentStatus === "PAID" ? "PAID" : rawStatus;
+      const effectiveStatus = fee <= 0 ? rawStatus : invoiceAmounts.received >= fee ? "PAID" : invoiceAmounts.awaitingApproval > 0 ? "PAYMENT_PENDING" : rawStatus === "PAID" ? "UNPAID" : rawStatus;
 
       return {
         teamId: team._id,
@@ -4990,11 +5137,11 @@ exports.getPlayerDetails = async (req, res) => {
           termName: term?.name || "No term linked",
           year: term?.year || null,
           status: leagueEntry.status || "ACTIVE",
-          paymentStatus: invoice?.paymentStatus === "PAID" ? "PAID" : rawStatus,
+          paymentStatus: fee <= 0 ? rawStatus : amounts.received >= fee ? "PAID" : amounts.awaitingApproval > 0 ? "PAYMENT_PENDING" : rawStatus === "PAID" ? "UNPAID" : rawStatus,
           fee,
           discount: amounts.discount,
-          amountReceived: invoice ? amounts.received : rawStatus === "PAID" ? fee : 0,
-          amountPending: invoice ? amounts.pending : ["UNPAID", "OVER_DUE"].includes(rawStatus) ? fee : 0,
+          amountReceived: invoice ? amounts.received : 0,
+          amountPending: invoice ? amounts.pending : (["UNPAID", "OVER_DUE"].includes(rawStatus) || rawStatus === "PAID") ? fee : 0,
           amountAwaitingApproval: amounts.awaitingApproval,
           invoiceId: invoice?._id || null,
           invoiceNumber: invoice?.invoiceNumber || null,
@@ -5104,7 +5251,15 @@ exports.getPlayerDetails = async (req, res) => {
         ? registration.invoice
         : playerInvoices.find((item) => String(item._id) === String(registration.invoice || ""));
       const amounts = getInvoiceAmounts(invoice);
-      const registrationStatus = String(invoice?.paymentStatus || registration.paymentStatus || "UNPAID").toUpperCase();
+      const storedRegistrationStatus = String(invoice?.paymentStatus || registration.paymentStatus || "UNPAID").toUpperCase();
+      const registrationAmount = Number(invoice?.totalAmount ?? registration.totalAmount ?? 0);
+      const registrationStatus = registrationAmount <= 0
+        ? storedRegistrationStatus
+        : amounts.received >= registrationAmount
+          ? "PAID"
+          : amounts.awaitingApproval > 0
+            ? "PAYMENT_PENDING"
+            : storedRegistrationStatus === "PAID" || storedRegistrationStatus === "APPROVED" ? "UNPAID" : storedRegistrationStatus;
       const term = event.termId || null;
       paymentHistory.push({
         id: `event-registration-${registration._id}`,
@@ -5115,10 +5270,10 @@ exports.getPlayerDetails = async (req, res) => {
         termId: term?._id ? term._id.toString() : null,
         termName: term?.name || "No term linked",
         year: term?.year || null,
-        fee: Number(invoice?.totalAmount ?? registration.totalAmount ?? 0),
+        fee: registrationAmount,
         discount: amounts.discount,
-        amountReceived: invoice ? amounts.received : registrationStatus === "PAID" || registrationStatus === "APPROVED" ? Number(registration.totalAmount) || 0 : 0,
-        amountPending: invoice ? amounts.pending : ["UNPAID", "OVER_DUE", "PAYMENT_PENDING"].includes(registrationStatus) ? Number(registration.totalAmount) || 0 : 0,
+        amountReceived: invoice ? amounts.received : 0,
+        amountPending: invoice ? amounts.pending : (registrationAmount > 0 && registrationStatus !== "PAID" ? registrationAmount : 0),
         amountAwaitingApproval: amounts.awaitingApproval,
         paymentStatus: registrationStatus,
         invoiceNumber: invoice?.invoiceNumber || null,
@@ -5142,7 +5297,8 @@ exports.getPlayerDetails = async (req, res) => {
         : order.invoice?.paymentStatus || order.paymentStatus || "PENDING").toUpperCase();
       const amount = Number(order.totalAmount || order.invoice?.totalAmount || 0);
       const receiptAmounts = getInvoiceAmounts(order.invoice);
-      const orderIsPaid = status === "PAID" || order.invoice?.paymentStatus === "PAID";
+      const orderIsPaid = amount <= 0 || receiptAmounts.received >= amount;
+      const effectiveOrderStatus = orderIsPaid ? "PAID" : receiptAmounts.awaitingApproval > 0 ? "PAYMENT_PENDING" : status === "PAID" ? "UNPAID" : status;
       paymentHistory.push({
         id: `order-${order._id}`,
         type: "STORE_ORDER",
@@ -5160,10 +5316,10 @@ exports.getPlayerDetails = async (req, res) => {
         termName: "Family purchase · no term linked",
         fee: amount,
         discount: receiptAmounts.discount || Number(order.invoice?.discount) || 0,
-        amountReceived: order.invoice ? receiptAmounts.received : orderIsPaid ? amount : 0,
-        amountPending: order.invoice ? receiptAmounts.pending : orderIsPaid || status === "PENDING" ? 0 : amount,
+        amountReceived: order.invoice ? receiptAmounts.received : 0,
+        amountPending: order.invoice ? receiptAmounts.pending : orderIsPaid ? 0 : amount,
         amountAwaitingApproval: order.invoice ? receiptAmounts.awaitingApproval : status === "PENDING" ? amount : 0,
-        paymentStatus: status,
+        paymentStatus: effectiveOrderStatus,
         invoiceNumber: order.invoice?.invoiceNumber || null,
         invoiceId: invoiceId || null,
         invoiceStatus: order.invoice?.paymentStatus || status,
@@ -5201,7 +5357,7 @@ exports.getPlayerDetails = async (req, res) => {
           amountReceived: amounts.received,
           amountPending: amounts.pending,
           amountAwaitingApproval: amounts.awaitingApproval,
-          paymentStatus: inv.paymentStatus || "UNPAID",
+          paymentStatus: fee <= 0 ? inv.paymentStatus || "UNPAID" : amounts.received >= fee ? "PAID" : amounts.awaitingApproval > 0 ? "PAYMENT_PENDING" : inv.paymentStatus === "PAID" ? "UNPAID" : inv.paymentStatus || "UNPAID",
           invoiceNumber: inv.invoiceNumber,
           invoiceId: inv._id,
           invoiceStatus: inv.paymentStatus,
@@ -6057,14 +6213,13 @@ exports.getAdminDashboardOverview = async (req, res) => {
       totalEventRegistrations,
 
       totalInvoices,
-      paidInvoices,
-      unpaidInvoices,
+      activeFinancialInvoices,
+      approvedFinancialReceipts,
       pendingPaymentApprovals,
       rejectedPayments,
       todaysCollectionsAgg,
       monthlyCollectionsAgg,
       totalRevenueAgg,
-      outstandingAmountAgg,
 
       totalProducts,
       totalOrders,
@@ -6130,14 +6285,16 @@ exports.getAdminDashboardOverview = async (req, res) => {
       EventRegistration.countDocuments({ status: "REGISTERED" }),
 
       Invoice.countDocuments({ status: "ACTIVE" }),
-      Invoice.countDocuments({ status: "ACTIVE", paymentStatus: "PAID" }),
-      Invoice.countDocuments({ status: "ACTIVE", paymentStatus: { $ne: "PAID" } }),
+      Invoice.find({ status: "ACTIVE" }).select("_id totalAmount amount").lean(),
+      Payment.aggregate([
+        { $match: { status: "APPROVED" } },
+        { $group: { _id: "$invoice", total: { $sum: "$amount" } } },
+      ]),
       Payment.countDocuments({ status: "PENDING" }),
       Payment.countDocuments({ status: "REJECTED" }),
       Payment.aggregate([{ $match: { status: "APPROVED", approvedAt: { $gte: startOfToday } } }, { $group: { _id: null, total: { $sum: "$amount" } } }]),
       Payment.aggregate([{ $match: { status: "APPROVED", approvedAt: { $gte: startOfMonth } } }, { $group: { _id: null, total: { $sum: "$amount" } } }]),
       Payment.aggregate([{ $match: { status: "APPROVED" } }, { $group: { _id: null, total: { $sum: "$amount" } } }]),
-      Invoice.aggregate([{ $match: { status: "ACTIVE", paymentStatus: { $ne: "PAID" } } }, { $group: { _id: null, total: { $sum: { $cond: [{ $gt: ["$totalAmount", 0] }, "$totalAmount", { $ifNull: ["$amount", 0] }] } } } }]),
 
       Product.countDocuments({}),
       Order.countDocuments({}),
@@ -6176,6 +6333,19 @@ exports.getAdminDashboardOverview = async (req, res) => {
         .sort({ createdAt: -1 })
         .limit(5),
     ]);
+
+    const approvedFinancialReceiptsByInvoice = new Map(
+      approvedFinancialReceipts.map((row) => [String(row._id), Number(row.total) || 0])
+    );
+    const paidInvoices = activeFinancialInvoices.filter((invoice) => {
+      const due = Math.max(0, Number(invoice.totalAmount ?? invoice.amount) || 0);
+      return due === 0 || (approvedFinancialReceiptsByInvoice.get(String(invoice._id)) || 0) >= due - 0.009;
+    }).length;
+    const unpaidInvoices = Math.max(0, totalInvoices - paidInvoices);
+    const outstandingAmount = activeFinancialInvoices.reduce((sum, invoice) => {
+      const due = Math.max(0, Number(invoice.totalAmount ?? invoice.amount) || 0);
+      return sum + Math.max(0, due - (approvedFinancialReceiptsByInvoice.get(String(invoice._id)) || 0));
+    }, 0);
 
     const requestTypesBreakdown = {};
     (requestTypesAggregate || []).forEach((item) => {
@@ -6243,7 +6413,7 @@ exports.getAdminDashboardOverview = async (req, res) => {
         totalRevenue: totalRevenueAgg.length > 0 ? totalRevenueAgg[0].total : 0,
         todaysCollections: todaysCollectionsAgg.length > 0 ? todaysCollectionsAgg[0].total : 0,
         monthlyCollections: monthlyCollectionsAgg.length > 0 ? monthlyCollectionsAgg[0].total : 0,
-        outstandingAmount: outstandingAmountAgg.length > 0 ? outstandingAmountAgg[0].total : 0,
+        outstandingAmount,
         pendingPaymentApprovals,
         rejectedPayments,
       },
@@ -6377,29 +6547,10 @@ exports.getAdminTermDashboardInsights = async (req, res) => {
       }
     }
 
-    const paidInvoiceEnrolments = new Set();
-    for (const invoice of invoices) {
-      if (invoice.paymentStatus !== "PAID" || !invoice.class) continue;
-      for (const playerId of invoice.players || []) paidInvoiceEnrolments.add(`${String(playerId)}:${String(invoice.class)}`);
-    }
-
     const statusCounts = {
       PAID: 0, UNPAID: 0, OVER_DUE: 0, TRIAL: 0, HANDSHAKE: 0, EXTRA: 0, TBC: 0, SUBSTITUTE: 0,
     };
     const enrolmentStatus = new Map();
-    for (const [key, enrolment] of enrolments) {
-      const { player, classDoc } = enrolment;
-      const matchingStatus = (player.classPaymentStatuses || []).find((entry) =>
-        String(entry.class?._id || entry.class || "") === String(classDoc._id)
-      );
-      const status = String(matchingStatus?.paymentStatus || player.paymentStatus || "TRIAL").toUpperCase();
-      const enrolmentKey = `${String(player._id)}:${String(classDoc._id)}`;
-      const resolvedStatus = paidInvoiceEnrolments.has(enrolmentKey) ? "PAID" : status;
-      const normalizedStatus = Object.prototype.hasOwnProperty.call(statusCounts, resolvedStatus) ? resolvedStatus : "UNPAID";
-      statusCounts[normalizedStatus] += 1;
-      enrolmentStatus.set(key, normalizedStatus);
-    }
-
     const invoiceIds = invoices.map((invoice) => invoice._id);
     const approvedPayments = invoiceIds.length
       ? await Payment.aggregate([
@@ -6408,19 +6559,36 @@ exports.getAdminTermDashboardInsights = async (req, res) => {
         ])
       : [];
     const paidByInvoice = new Map(approvedPayments.map((item) => [String(item._id), Number(item.amount) || 0]));
+    const invoiceStatusByEnrolment = new Map();
+    const invoicedEnrolments = new Set();
+    for (const invoice of invoices) {
+      if (!invoice.class) continue;
+      const due = Math.max(0, Number(invoice.totalAmount ?? invoice.amount) || 0);
+      const received = paidByInvoice.get(String(invoice._id)) || 0;
+      const status = due <= 0 || received >= due - 0.009 ? "PAID" : "UNPAID";
+      for (const playerId of invoice.players || []) {
+        const key = `${String(playerId)}:${String(invoice.class)}`;
+        invoiceStatusByEnrolment.set(key, status);
+        invoicedEnrolments.add(key);
+      }
+    }
+    for (const [key, enrolment] of enrolments) {
+      const { player, classDoc } = enrolment;
+      const matchingStatus = (player.classPaymentStatuses || []).find((entry) => String(entry.class?._id || entry.class || "") === String(classDoc._id));
+      const fallbackStatus = String(matchingStatus?.paymentStatus || player.paymentStatus || "TRIAL").toUpperCase();
+      const effectiveStatus = invoiceStatusByEnrolment.get(key)
+        || (!invoicedEnrolments.has(key) && fallbackStatus === "PAID" && Number(classDoc.price || 0) > 0 ? "UNPAID" : fallbackStatus);
+      const normalizedStatus = Object.prototype.hasOwnProperty.call(statusCounts, effectiveStatus) ? effectiveStatus : "UNPAID";
+      statusCounts[normalizedStatus] += 1;
+      enrolmentStatus.set(key, normalizedStatus);
+    }
     let unpaidAmount = 0;
     let invoiceDiscounts = 0;
-    const invoicedEnrolments = new Set();
     for (const invoice of invoices) {
       const amount = Number(invoice.totalAmount ?? invoice.amount) || 0;
       const discount = Number(invoice.discount) || 0;
       invoiceDiscounts += discount;
-      for (const playerId of invoice.players || []) {
-        if (invoice.class) invoicedEnrolments.add(`${String(playerId)}:${String(invoice.class)}`);
-      }
-      if (invoice.paymentStatus !== "PAID") {
-        unpaidAmount += Math.max(0, amount - (paidByInvoice.get(String(invoice._id)) || 0));
-      }
+      unpaidAmount += Math.max(0, amount - (paidByInvoice.get(String(invoice._id)) || 0));
     }
 
     let waivedHandshakeAmount = 0;

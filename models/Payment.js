@@ -18,7 +18,7 @@ const paymentSchema = new mongoose.Schema(
     },
     paymentMethod: {
       type: String,
-      enum: ["ONLINE", "COD"],
+      enum: ["ONLINE", "COD", "ADMIN_MANUAL"],
       required: true,
     },
     transactionId: {
