@@ -189,24 +189,47 @@ exports.getNotesByPlayer = async (req, res) => {
       query.isPersonal = isPersonal === "true";
     }
 
-    const classScopeConditions = [];
-    if (termId) {
-      const classIds = mongoose.Types.ObjectId.isValid(termId)
-        ? await Class.find({ term: termId }).distinct("_id")
+    const yearNumber = Number(year);
+    const hasYear = year !== undefined && year !== "" && Number.isInteger(yearNumber) && yearNumber >= 1900;
+    const yearCreatedAt = hasYear
+      ? { createdAt: { $gte: new Date(Date.UTC(yearNumber, 0, 1)), $lt: new Date(Date.UTC(yearNumber + 1, 0, 1)) } }
+      : null;
+    let classScopeCondition = null;
+
+    if (noTerm === "true") {
+      const noTermClassIds = await Class.find({ $or: [{ term: null }, { term: { $exists: false } }] }).distinct("_id");
+      const noTermCondition = { $or: [{ classId: null }, { classId: { $in: noTermClassIds } }] };
+      classScopeCondition = yearCreatedAt
+        ? { $and: [noTermCondition, yearCreatedAt] }
+        : noTermCondition;
+    } else if (termId) {
+      const termQuery = { _id: termId };
+      if (hasYear) termQuery.year = yearNumber;
+      const matchingTermIds = mongoose.Types.ObjectId.isValid(termId)
+        ? await Term.find(termQuery).distinct("_id")
         : [];
-      classScopeConditions.push({ classId: { $in: classIds } });
-    } else if (year) {
-      const termIds = await Term.find({ year: Number(year) }).distinct("_id");
-      const classIds = termIds.length ? await Class.find({ term: { $in: termIds } }).distinct("_id") : [];
-      classScopeConditions.push({ classId: { $in: classIds } });
-    } else if (noTerm === "true") {
-      const classIds = await Class.find({ $or: [{ term: null }, { term: { $exists: false } }] }).distinct("_id");
-      classScopeConditions.push({ $or: [{ classId: null }, { classId: { $in: classIds } }] });
+      const classIds = matchingTermIds.length
+        ? await Class.find({ term: { $in: matchingTermIds } }).distinct("_id")
+        : [];
+      classScopeCondition = { classId: { $in: classIds } };
+    } else if (yearCreatedAt) {
+      const termIds = await Term.find({ year: yearNumber }).distinct("_id");
+      const yearClassIds = termIds.length
+        ? await Class.find({ term: { $in: termIds } }).distinct("_id")
+        : [];
+      const noTermClassIds = await Class.find({ $or: [{ term: null }, { term: { $exists: false } }] }).distinct("_id");
+      const noTermCondition = { $or: [{ classId: null }, { classId: { $in: noTermClassIds } }] };
+      classScopeCondition = {
+        $or: [
+          { classId: { $in: yearClassIds } },
+          { $and: [noTermCondition, yearCreatedAt] },
+        ],
+      };
     }
-    if (classScopeConditions.length) {
-      classScopeConditions.unshift({ $or: query.$or });
+
+    if (classScopeCondition) {
+      query.$and = [{ $or: query.$or }, classScopeCondition];
       delete query.$or;
-      query.$and = classScopeConditions;
     }
 
     const total = await CoachNote.countDocuments(query);

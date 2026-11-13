@@ -4924,7 +4924,7 @@ exports.getPlayerDetails = async (req, res) => {
         .populate("invoice")
         .sort({ createdAt: -1 }).lean() : [],
       canReadLeagues ? PlayerStatistics.find({ player: playerId, ...(assignedOnly ? { team: { $in: assignedTeamIds } } : {}) })
-        .populate({ path: "league", select: "name season term startDate endDate", populate: { path: "term", select: "name year startDate endDate isEvent" } })
+        .populate({ path: "league", select: "name season year term termScope startDate endDate", populate: { path: "term", select: "name year startDate endDate isEvent" } })
         .populate("team", "teamName")
         .sort({ updatedAt: -1 }).lean() : [],
     ]);
@@ -5070,7 +5070,7 @@ exports.getPlayerDetails = async (req, res) => {
     const assignedTeams = canReadTeams ? await Team.find({ "players.player": playerId, ...(assignedOnly ? { _id: { $in: assignedTeamIds } } : {}) })
       .select("teamName teamFee logo players ageGroup term leagues")
       .populate("term", "name year startDate endDate isEvent")
-      .populate({ path: "leagues.league", select: "name season term startDate endDate", populate: { path: "term", select: "name year startDate endDate isEvent" } })
+      .populate({ path: "leagues.league", select: "name season year termScope term startDate endDate", populate: { path: "term", select: "name year startDate endDate isEvent" } })
       .lean() : [];
 
     const assignedTeamsPaymentInfo = assignedTeams.map((team) => {
@@ -5126,7 +5126,10 @@ exports.getPlayerDetails = async (req, res) => {
         const invoice = playerInvoices.find((item) => String(item.league?._id || item.league || "") === leagueId && String(item.team?._id || item.team || "") === String(team._id));
         const amounts = getInvoiceAmounts(invoice);
         const fee = Number(invoice?.totalAmount ?? leagueEntry.teamFee ?? league?.fee ?? 0);
-        const term = league?.term || team.term || null;
+        const term = league?.termScope === "INDEPENDENT" ? null : league?.term || team.term || null;
+        const startDate = league?.startDate || null;
+        const endDate = league?.endDate || null;
+        const year = term?.year || league?.year || (startDate ? new Date(startDate).getUTCFullYear() : null);
         return {
           leagueId,
           leagueName: league?.name || "League",
@@ -5135,7 +5138,9 @@ exports.getPlayerDetails = async (req, res) => {
           teamName: team.teamName,
           termId: term?._id ? term._id.toString() : null,
           termName: term?.name || "No term linked",
-          year: term?.year || null,
+          year,
+          startDate,
+          endDate,
           status: leagueEntry.status || "ACTIVE",
           paymentStatus: fee <= 0 ? rawStatus : amounts.received >= fee ? "PAID" : amounts.awaitingApproval > 0 ? "PAYMENT_PENDING" : rawStatus === "PAID" ? "UNPAID" : rawStatus,
           fee,
@@ -5232,6 +5237,9 @@ exports.getPlayerDetails = async (req, res) => {
         termId: league.termId,
         termName: league.termName,
         year: league.year,
+        season: league.season,
+        startDate: league.startDate,
+        endDate: league.endDate,
         fee: league.fee,
         discount: league.discount,
         amountReceived: league.amountReceived,
@@ -5269,7 +5277,9 @@ exports.getPlayerDetails = async (req, res) => {
         name: event.title || "Event registration",
         termId: term?._id ? term._id.toString() : null,
         termName: term?.name || "No term linked",
-        year: term?.year || null,
+        year: term?.year || (event.startDate ? new Date(event.startDate).getUTCFullYear() : null),
+        startDate: event.startDate || null,
+        endDate: event.endDate || null,
         fee: registrationAmount,
         discount: amounts.discount,
         amountReceived: invoice ? amounts.received : 0,
@@ -5415,6 +5425,9 @@ exports.getPlayerDetails = async (req, res) => {
         invoiceNumber: relatedItem?.invoiceNumber || null,
         termId: relatedItem?.termId || null,
         termName: relatedItem?.termName || "No term linked",
+        year: relatedItem?.year || null,
+        startDate: relatedItem?.startDate || null,
+        endDate: relatedItem?.endDate || null,
         name: relatedItem?.name || "Payment",
         householdPurchase: Boolean(relatedItem?.householdPurchase),
         amount: Number(payment.amount) || 0,
@@ -5436,7 +5449,9 @@ exports.getPlayerDetails = async (req, res) => {
       teamName: entry.team?.teamName || "",
       termId: entry.league?.term?._id ? entry.league.term._id.toString() : null,
       termName: entry.league?.term?.name || "No term linked",
-      year: entry.league?.term?.year || null,
+      year: entry.league?.term?.year || entry.league?.year || (entry.league?.startDate ? new Date(entry.league.startDate).getUTCFullYear() : null),
+      startDate: entry.league?.startDate || null,
+      endDate: entry.league?.endDate || null,
       statistics: {
         appearances: Number(entry.appearances) || 0,
         goals: Number(entry.goals) || 0,
